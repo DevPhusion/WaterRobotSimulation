@@ -1,0 +1,295 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+  <world name="water_test">
+
+    <physics name="1ms" type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <gravity>0 0 -9.81</gravity>
+
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+      <background_color>0.8 0.8 0.8</background_color>
+    </plugin>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+
+    <!-- ================= WIND =================
+         Built-in gz-sim wind model. Only links with <enable_wind>true</enable_wind>
+         are affected (see the hull link below). -->
+    <plugin filename="gz-sim-wind-effects-system" name="gz::sim::systems::WindEffects">
+      <force_approximation_scaling_factor>1.0</force_approximation_scaling_factor>
+      <horizontal>
+        <magnitude>
+          <time_for_rise>5</time_for_rise>
+          <sin>
+            <amplitude_percent>0.05</amplitude_percent>
+            <period>60</period>
+          </sin>
+          <noise type="gaussian">
+            <mean>2.0</mean>
+            <stddev>0.5</stddev>
+          </noise>
+        </magnitude>
+        <direction>
+          <time_for_rise>2</time_for_rise>
+          <sin>
+            <amplitude>5</amplitude>
+            <period>20</period>
+          </sin>
+          <noise type="gaussian">
+            <mean>0</mean>
+            <stddev>2</stddev>
+          </noise>
+        </direction>
+      </horizontal>
+      <vertical>
+        <time_for_rise>5</time_for_rise>
+        <noise type="gaussian">
+          <mean>0</mean>
+          <stddev>0.05</stddev>
+        </noise>
+      </vertical>
+    </plugin>
+
+    <scene>
+      <ambient>1.0 1.0 1.0</ambient>
+      <background>0.8 0.8 0.8</background>
+    </scene>
+
+    <light type="directional" name="sun">
+      <cast_shadows>false</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>1 1 1 1</diffuse>
+      <specular>0.5 0.5 0.5 1</specular>
+      <direction>-0.3 0.3 -0.9</direction>
+    </light>
+
+    <!-- ================= WAVE FIELD =================
+         Local copy of the "waves" model, referenced by absolute path so it
+         doesn't depend on GZ_SIM_RESOURCE_PATH being set correctly. -->
+    <include>
+      <pose>0 0 0 0 0 0</pose>
+      <uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/waves</uri>
+    </include>
+
+    <!-- ================= OCEAN CURRENT =================
+         No plugin needed here: the Hydrodynamics system attached to "hull" below
+         already listens on /ocean_current:
+           gz topic -t /ocean_current -m gz.msgs.Vector3d -p 'x: 1.0, y: 0.3, z: 0' -->
+
+    <!-- ================= PID TEST PATH =================
+         Two stationary, non-colliding markers defining the straight-line
+         path the boat should hold in PID mode. Their positions MUST match
+         START_POINT / END_POINT in the control script — if you move one,
+         move the other. Boat spawns at (0,0) facing +x (yaw 0), so the
+         line runs straight down the +x axis by default. -->
+    <model name="start_marker">
+      <static>true</static>
+      <pose>0 0 0.5 0 0 0</pose>
+      <link name="link">
+        <visual name="visual">
+          <geometry><cylinder><radius>0.05</radius><length>1.0</length></cylinder></geometry>
+          <material><ambient>0 1 0 1</ambient><diffuse>0 1 0 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="end_marker">
+      <static>true</static>
+      <pose>20 0 0.5 0 0 0</pose>
+      <link name="link">
+        <visual name="visual">
+          <geometry><cylinder><radius>0.05</radius><length>1.0</length></cylinder></geometry>
+          <material><ambient>1 0 0 1</ambient><diffuse>1 0 0 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Placeholder dual-thruster boat: replace hull geometry with your CAD mesh later -->
+    <model name="test_boat">
+      <pose>0 0 0.1 0 0.031 0</pose>
+
+      <!-- ================= HULL: CAD-approximation ================
+           Built from primitives (SDF has no boolean-cut geometry, so exact
+           curves/cutouts aren't possible without importing the real CAD as
+           a mesh). Footprint matches the two given dimensions: 0.485 m
+           long (X) x 0.4 m wide (Y). Deck thickness (0.04 m), fork-notch
+           width (0.15 m), and all other proportions are eyeballed from the
+           render and NOT exact - tweak the numbers below if you know the
+           real values, or swap these primitives for
+           <mesh><uri>...</uri></mesh> collision+visual once you have an
+           exported .dae/.stl/.obj for a pixel-perfect match. -->
+      <link name="hull">
+        <inertial>
+          <mass>1.0</mass>
+          <inertia>
+            <ixx>0.404</ixx><iyy>0.59206</iyy><izz>0.98806</izz>
+            <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+          </inertia>
+        </inertial>
+        <enable_wind>true</enable_wind>
+
+        <!-- rounded nose -->
+        <collision name="collision_nose">
+          <pose>0.0425 0 0 0 0 0</pose>
+          <geometry><cylinder><radius>0.2</radius><length>0.04</length></cylinder></geometry>
+        </collision>
+        <visual name="visual_nose">
+          <pose>0.0425 0 0 0 0 0</pose>
+          <geometry><cylinder><radius>0.2</radius><length>0.04</length></cylinder></geometry>
+          <material><ambient>0.85 0.35 0.05 1</ambient><diffuse>0.85 0.35 0.05 1</diffuse></material>
+        </visual>
+
+        <!-- rectangular mid-body -->
+        <collision name="collision_body">
+          <pose>-0.06 0 0 0 0 0</pose>
+          <geometry><box><size>0.205 0.4 0.04</size></box></geometry>
+        </collision>
+        <visual name="visual_body">
+          <pose>-0.06 0 0 0 0 0</pose>
+          <geometry><box><size>0.205 0.4 0.04</size></box></geometry>
+          <material><ambient>0.85 0.35 0.05 1</ambient><diffuse>0.85 0.35 0.05 1</diffuse></material>
+        </visual>
+
+        <!-- rear legs either side of the fork notch -->
+        <collision name="collision_leg_left">
+          <pose>-0.2025 0.1375 0 0 0 0</pose>
+          <geometry><box><size>0.08 0.125 0.04</size></box></geometry>
+        </collision>
+        <visual name="visual_leg_left">
+          <pose>-0.2025 0.1375 0 0 0 0</pose>
+          <geometry><box><size>0.08 0.125 0.04</size></box></geometry>
+          <material><ambient>0.85 0.35 0.05 1</ambient><diffuse>0.85 0.35 0.05 1</diffuse></material>
+        </visual>
+
+        <collision name="collision_leg_right">
+          <pose>-0.2025 -0.1375 0 0 0 0</pose>
+          <geometry><box><size>0.08 0.125 0.04</size></box></geometry>
+        </collision>
+        <visual name="visual_leg_right">
+          <pose>-0.2025 -0.1375 0 0 0 0</pose>
+          <geometry><box><size>0.08 0.125 0.04</size></box></geometry>
+          <material><ambient>0.85 0.35 0.05 1</ambient><diffuse>0.85 0.35 0.05 1</diffuse></material>
+        </visual>
+
+        <!-- raised center boss (visual only - not structurally load-bearing) -->
+        <visual name="visual_center_block">
+          <pose>0.0 0 0.05 0 0 0</pose>
+          <geometry><box><size>0.1 0.08 0.06</size></box></geometry>
+          <material><ambient>0.8 0.8 0.85 1</ambient><diffuse>0.8 0.8 0.85 1</diffuse></material>
+        </visual>
+
+        <!-- carry handle, approximated as two posts + a crossbar (visual only) -->
+        <visual name="visual_handle_post_l">
+          <pose>0.0 0.035 0.045 0 0 0</pose>
+          <geometry><cylinder><radius>0.006</radius><length>0.05</length></cylinder></geometry>
+          <material><ambient>0.85 0.35 0.05 1</ambient><diffuse>0.85 0.35 0.05 1</diffuse></material>
+        </visual>
+        <visual name="visual_handle_post_r">
+          <pose>0.0 -0.035 0.045 0 0 0</pose>
+          <geometry><cylinder><radius>0.006</radius><length>0.05</length></cylinder></geometry>
+          <material><ambient>0.85 0.35 0.05 1</ambient><diffuse>0.85 0.35 0.05 1</diffuse></material>
+        </visual>
+        <visual name="visual_handle_bar">
+          <pose>0.0 0 0.075 1.5708 0 0</pose>
+          <geometry><cylinder><radius>0.006</radius><length>0.076</length></cylinder></geometry>
+          <material><ambient>0.85 0.35 0.05 1</ambient><diffuse>0.85 0.35 0.05 1</diffuse></material>
+        </visual>
+
+        <!-- side vent slots near the nose (flush dark overlays - a real cut
+             needs a mesh) -->
+        <visual name="visual_slot_left">
+          <pose>0.12 0.09 0.021 0 0 0</pose>
+          <geometry><box><size>0.09 0.02 0.002</size></box></geometry>
+          <material><ambient>0.05 0.05 0.05 1</ambient><diffuse>0.05 0.05 0.05 1</diffuse></material>
+        </visual>
+        <visual name="visual_slot_right">
+          <pose>0.12 -0.09 0.021 0 0 0</pose>
+          <geometry><box><size>0.09 0.02 0.002</size></box></geometry>
+          <material><ambient>0.05 0.05 0.05 1</ambient><diffuse>0.05 0.05 0.05 1</diffuse></material>
+        </visual>
+      </link>
+
+      <!-- Thruster pods moved to the FRONT/nose area to match the CAD
+           renders (the old placeholder had them at the rear). -->
+      <link name="left_prop">
+        <pose relative_to="hull">0.10 0.14 0 0 1.5708 0</pose>
+        <inertial><mass>0.05</mass><inertia><ixx>1e-5</ixx><iyy>1e-5</iyy><izz>1e-5</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.025</radius><length>0.07</length></cylinder></geometry>
+          <material><ambient>0.1 0.1 0.1 1</ambient><diffuse>0.1 0.1 0.1 1</diffuse></material>
+        </visual>
+      </link>
+      <joint name="left_thruster_joint" type="revolute">
+        <parent>hull</parent>
+        <child>left_prop</child>
+        <axis><xyz>0 0 1</xyz><limit><lower>-1e16</lower><upper>1e16</upper></limit></axis>
+      </joint>
+
+      <link name="right_prop">
+        <pose relative_to="hull">0.10 -0.14 0 0 1.5708 0</pose>
+        <inertial><mass>0.05</mass><inertia><ixx>1e-5</ixx><iyy>1e-5</iyy><izz>1e-5</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.025</radius><length>0.07</length></cylinder></geometry>
+          <material><ambient>0.1 0.1 0.1 1</ambient><diffuse>0.1 0.1 0.1 1</diffuse></material>
+        </visual>
+      </link>
+      <joint name="right_thruster_joint" type="revolute">
+        <parent>hull</parent>
+        <child>right_prop</child>
+        <axis><xyz>0 0 1</xyz><limit><lower>-1e16</lower><upper>1e16</upper></limit></axis>
+      </joint>
+
+      <!-- Wave-aware hydrodynamics from asv_wave_sim: buoyancy against the live
+           wave surface + drag/damping, and it listens on /ocean_current for
+           current forcing. -->
+      <plugin filename="gz-waves1-hydrodynamics-system" name="gz::sim::systems::Hydrodynamics">
+        <enable>test_boat::hull</enable>
+        <hydrodynamics>
+          <damping_on>1</damping_on>
+          <viscous_drag_on>1</viscous_drag_on>
+          <pressure_drag_on>1</pressure_drag_on>
+
+          <cDampL1>1.0E-6</cDampL1>
+          <cDampL2>1.0E-6</cDampL2>
+          <cDampR1>1.0E-6</cDampR1>
+          <cDampR2>1.0E-6</cDampR2>
+
+          <cPDrag1>1.0E+2</cPDrag1>
+          <cPDrag2>1.0E+2</cPDrag2>
+          <fPDrag>0.4</fPDrag>
+          <cSDrag1>1.0E+2</cSDrag1>
+          <cSDrag2>1.0E+2</cSDrag2>
+          <fSDrag>0.4</fSDrag>
+          <vRDrag>1.0</vRDrag>
+        </hydrodynamics>
+        <markers>
+          <update_rate>10</update_rate>
+          <water_patch>0</water_patch>
+          <waterline>0</waterline>
+          <underwater_surface>0</underwater_surface>
+        </markers>
+      </plugin>
+
+      <plugin filename="gz-sim-thruster-system" name="gz::sim::systems::Thruster">
+        <joint_name>left_thruster_joint</joint_name>
+        <thrust_coefficient>0.005</thrust_coefficient>
+        <fluid_density>1000</fluid_density>
+        <propeller_diameter>0.05</propeller_diameter>
+      </plugin>
+
+      <plugin filename="gz-sim-thruster-system" name="gz::sim::systems::Thruster">
+        <joint_name>right_thruster_joint</joint_name>
+        <thrust_coefficient>0.005</thrust_coefficient>
+        <fluid_density>1000</fluid_density>
+        <propeller_diameter>0.05</propeller_diameter>
+      </plugin>
+
+    </model>
+
+  </world>
+</sdf>

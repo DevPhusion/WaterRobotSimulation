@@ -1,0 +1,349 @@
+<?xml version="1.0" ?>
+<!-- Generated using onshape-to-robot -->
+<!-- Onshape https://cad.onshape.com/documents/6eb7df6ad5b8443dd56873d1/w/1d8acdecdc0089acabde53de/e/0f33d3b56a884738c50d838c -->
+<robot name="C:\Users\Admin\rescue-float-robot">
+  <!-- Link body -->
+  <link name="body">
+    <inertial>
+      <origin xyz="-0.120871 -0.0986836 0.0402296" rpy="0 0 0"/>
+      <mass value="1.57719"/>
+      <inertia ixx="0.019491" ixy="3e-12" ixz="-2.5e-11" iyy="0.0249308" iyz="-0.0042009" izz="0.0389179"/>
+    </inertial>
+    <!-- Part box -->
+    <visual>
+      <origin xyz="-0.120871 -0.0388032 0.0703204" rpy="0 -0 1.5708"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/box.stl"/>
+      </geometry>
+      <material name="box_material">
+        <color rgba="0.901961 0.901961 0.901961 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.120871 -0.0388032 0.0703204" rpy="0 -0 1.5708"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/box.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part case_part_2 -->
+    <visual>
+      <origin xyz="-0.275871 -0.159253 -0.00865457" rpy="0 -0 3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/case_part_2.stl"/>
+      </geometry>
+      <material name="case_part_2_material">
+        <color rgba="0.913725 0.647059 0.329412 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.275871 -0.159253 -0.00865457" rpy="0 -0 3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/case_part_2.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part motor -->
+    <visual>
+      <origin xyz="-0.275871 -0.159253 -0.00865457" rpy="0 -0 3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/motor.stl"/>
+      </geometry>
+      <material name="motor_material">
+        <color rgba="0.6 0.6 0.6 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.275871 -0.159253 -0.00865457" rpy="0 -0 3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/motor.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part extension_shaft -->
+    <visual>
+      <origin xyz="-0.275871 -0.159253 -0.00865457" rpy="0 -0 -3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/extension_shaft.stl"/>
+      </geometry>
+      <material name="extension_shaft_material">
+        <color rgba="0.6 0.6 0.6 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.275871 -0.159253 -0.00865457" rpy="0 -0 -3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/extension_shaft.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part case_part_3 -->
+    <visual>
+      <origin xyz="-0.275871 -0.159253 -0.00865457" rpy="0 -0 3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/case_part_3.stl"/>
+      </geometry>
+      <material name="case_part_3_material">
+        <color rgba="0.972549 0.529412 0.00392157 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.275871 -0.159253 -0.00865457" rpy="0 -0 3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/case_part_3.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part case_part_1 -->
+    <visual>
+      <origin xyz="-0.275871 -0.159253 -0.00865457" rpy="0 -0 3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/case_part_1.stl"/>
+      </geometry>
+      <material name="case_part_1_material">
+        <color rgba="0.917647 0.917647 0.917647 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.275871 -0.159253 -0.00865457" rpy="0 -0 3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/case_part_1.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part extension -->
+    <visual>
+      <origin xyz="-0.275871 -0.159253 -0.00865457" rpy="0 -0 -3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/extension.stl"/>
+      </geometry>
+      <material name="extension_material">
+        <color rgba="0.823529 0.623529 0.0352941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.275871 -0.159253 -0.00865457" rpy="0 -0 -3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/extension.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part case_part_2_2 -->
+    <visual>
+      <origin xyz="0.0341294 -0.159253 -0.00865457" rpy="0 -0 3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/case_part_2.stl"/>
+      </geometry>
+      <material name="case_part_2_2_material">
+        <color rgba="0.913725 0.647059 0.329412 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0.0341294 -0.159253 -0.00865457" rpy="0 -0 3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/case_part_2.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part motor_2 -->
+    <visual>
+      <origin xyz="0.0341294 -0.159253 -0.00865457" rpy="0 -0 3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/motor.stl"/>
+      </geometry>
+      <material name="motor_2_material">
+        <color rgba="0.6 0.6 0.6 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0.0341294 -0.159253 -0.00865457" rpy="0 -0 3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/motor.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part extension_shaft_2 -->
+    <visual>
+      <origin xyz="0.0341294 -0.159253 -0.00865457" rpy="0 -0 -3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/extension_shaft.stl"/>
+      </geometry>
+      <material name="extension_shaft_2_material">
+        <color rgba="0.6 0.6 0.6 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0.0341294 -0.159253 -0.00865457" rpy="0 -0 -3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/extension_shaft.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part case_part_3_2 -->
+    <visual>
+      <origin xyz="0.0341294 -0.159253 -0.00865457" rpy="0 -0 3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/case_part_3.stl"/>
+      </geometry>
+      <material name="case_part_3_2_material">
+        <color rgba="0.972549 0.529412 0.00392157 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0.0341294 -0.159253 -0.00865457" rpy="0 -0 3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/case_part_3.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part case_part_1_2 -->
+    <visual>
+      <origin xyz="0.0341294 -0.159253 -0.00865457" rpy="0 -0 3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/case_part_1.stl"/>
+      </geometry>
+      <material name="case_part_1_2_material">
+        <color rgba="0.917647 0.917647 0.917647 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0.0341294 -0.159253 -0.00865457" rpy="0 -0 3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/case_part_1.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part extension_2 -->
+    <visual>
+      <origin xyz="0.0341294 -0.159253 -0.00865457" rpy="0 -0 -3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/extension.stl"/>
+      </geometry>
+      <material name="extension_2_material">
+        <color rgba="0.823529 0.623529 0.0352941 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0.0341294 -0.159253 -0.00865457" rpy="0 -0 -3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/extension.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part top -->
+    <visual>
+      <origin xyz="-0.120871 -0.0538032 0.17032" rpy="3.14159 -0 3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/top.stl"/>
+      </geometry>
+      <material name="top_material">
+        <color rgba="1 0.4 0 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.120871 -0.0538032 0.17032" rpy="3.14159 -0 3.14159"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/top.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part bottom -->
+    <visual>
+      <origin xyz="-0.120871 -0.0538032 0.0322204" rpy="0 -0 0"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/bottom.stl"/>
+      </geometry>
+      <material name="bottom_material">
+        <color rgba="0.701961 0.701961 0.701961 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.120871 -0.0538032 0.0322204" rpy="0 -0 0"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/bottom.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part side_handle -->
+    <visual>
+      <origin xyz="0.0291294 -0.0838032 0.0703204" rpy="0 -0 1.5708"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/side_handle.stl"/>
+      </geometry>
+      <material name="side_handle_material">
+        <color rgba="1 0.4 0 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0.0291294 -0.0838032 0.0703204" rpy="0 -0 1.5708"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/side_handle.stl"/>
+      </geometry>
+    </collision>
+    <!-- Part side_handle_2 -->
+    <visual>
+      <origin xyz="-0.270871 -0.0838032 0.0703204" rpy="0 -0 1.5708"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/side_handle.stl"/>
+      </geometry>
+      <material name="side_handle_2_material">
+        <color rgba="1 0.4 0 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="-0.270871 -0.0838032 0.0703204" rpy="0 -0 1.5708"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/side_handle.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <!-- Link composite_part_1 -->
+  <link name="composite_part_1">
+    <inertial>
+      <origin xyz="-1.33321e-07 1.19698e-07 -0.00948776" rpy="0 0 0"/>
+      <mass value="0.00255468"/>
+      <inertia ixx="1.69776e-07" ixy="0" ixz="-4e-12" iyy="1.69725e-07" iyz="1e-12" izz="2.31945e-07"/>
+    </inertial>
+    <!-- Part composite_part_1 -->
+    <visual>
+      <origin xyz="0 0 0.160038" rpy="3.14159 -0 0"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/composite_part_1.stl"/>
+      </geometry>
+      <material name="composite_part_1_material">
+        <color rgba="0.917647 0.917647 0.917647 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.160038" rpy="3.14159 -0 0"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/composite_part_1.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <!-- Joint from body to composite_part_1 -->
+  <joint name="leftmotor" type="revolute">
+    <origin xyz="-0.275871 -0.242153 -0.00865457" rpy="-1.5708 0 0"/>
+    <parent link="body"/>
+    <child link="composite_part_1"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="10" velocity="10" lower="-3.141592653589793" upper="3.141592653589793"/>
+  </joint>
+  <!-- Link composite_part_1_2 -->
+  <link name="composite_part_1_2">
+    <inertial>
+      <origin xyz="-1.33321e-07 1.19698e-07 -0.00948776" rpy="0 0 0"/>
+      <mass value="0.00255468"/>
+      <inertia ixx="1.69776e-07" ixy="0" ixz="-4e-12" iyy="1.69725e-07" iyz="1e-12" izz="2.31945e-07"/>
+    </inertial>
+    <!-- Part composite_part_1_2 -->
+    <visual>
+      <origin xyz="0 0 0.160038" rpy="3.14159 -0 0"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/composite_part_1.stl"/>
+      </geometry>
+      <material name="composite_part_1_2_material">
+        <color rgba="0.917647 0.917647 0.917647 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.160038" rpy="3.14159 -0 0"/>
+      <geometry>
+        <mesh filename="file:///home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/assets/composite_part_1.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <!-- Joint from body to composite_part_1_2 -->
+  <joint name="rightmotor" type="revolute">
+    <origin xyz="0.0341294 -0.242153 -0.00865457" rpy="-1.5708 1.5708 0"/>
+    <parent link="body"/>
+    <child link="composite_part_1_2"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="10" velocity="10" lower="-3.141592653589793" upper="3.141592653589793"/>
+  </joint>
+</robot>
