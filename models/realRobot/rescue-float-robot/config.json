@@ -1,0 +1,11 @@
+{
+    "documentId": "6eb7df6ad5b8443dd56873d1",
+    "workspaceId": "1d8acdecdc0089acabde53de",
+    "assemblyName": "Main assembly",
+    "outputFormat": "urdf",
+    "drawFrames": false,
+    "drawCollisions": true,
+    "useFixedLinks": false,
+    "mergeSTLs": "no",
+    "simplifySTLs": "no"
+}

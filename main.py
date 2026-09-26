@@ -1,59 +1,63 @@
 #!/usr/bin/env python3
 """
-Autonomous "drive the line" control + live parameter tuning for the gz-sim
-dual-thruster boat, with:
+Autonomous batch tester for the gz-sim dual-thruster boat: No-PID vs PID
+divergence comparison, headless, over N randomized-wave runs.
 
-  - AUTO-LAUNCH (default): randomizes the wave field (wind speed, wind
-    direction, steepness) within configurable ranges, writes them into the
-    real waves model .sdf file, and starts `gz sim` itself in the
-    background - so every run of this script is a fresh, different sea
-    state, and you don't need a separate launcher script or a manually
-    pre-started sim. Pass --no-auto-launch to skip this and just connect to
-    a gz sim you already started yourself.
+WHAT THIS DOES
+    1. Pops up a small config window (number of runs, seed, timeouts, PID
+       gains, wave ranges, headless on/off, output paths).
+    2. For each run:
+         a. Randomizes wind speed/direction + wave steepness and writes them
+            into the waves model .sdf (same mechanism as main.py).
+         b. Launches `gz sim` headless (server only, no rendering -> fast).
+         c. Drives the boat with NO controller (constant thrust) along the
+            fixed START_POINT -> END_POINT line, tracking cross-track error.
+         d. Calls the world's WorldControl "reset" service (puts the boat
+            back at spawn, resets sim time to 0) - SAME wave field, so the
+            two phases are a fair paired comparison.
+         e. Re-runs the same line with the heading PID controller active.
+         f. Appends both phases' results (max |cross-track| divergence,
+            final progress, arrival, duration) to a summary CSV, and every
+            control-loop tick (time, position, heading, cross/along-track,
+            thrust) to a separate time-series CSV.
+         g. Kills this run's gz sim process before starting the next run,
+            since the wave field is only re-read at world load time.
+    3. After all runs, produces several plots:
+         - Scatter of |max cross-track divergence| per run: No PID vs PID
+           (integer-only run-number x-axis).
+         - Mean +/- std of |cross-track error| over time, No PID vs PID.
+         - Mean +/- std of heading (yaw, deg) over time, No PID vs PID.
+         - Mean +/- std of along-track progress over time, No PID vs PID.
 
-  - TWO NAV MODES, selectable in the UI before pressing Start:
-      * PID    - heading-hold PID controller tracking the fixed
-                 START_POINT -> END_POINT line (as before).
-      * Normal - no controller at all: both thrusters run at the same
-                 constant base-thrust value for the whole run. This is the
-                 baseline to compare PID against - run the same (or
-                 different) wave conditions through both modes and compare
-                 the cross-track/heading logs.
+    NOTE ON OUTPUT FILES: both the summary CSV and the time-series CSV are
+    reset (deleted, if present) at the START of each batch run, so that
+    results from a previous batch never get mixed in with the current one
+    (this used to cause duplicate/overlapping run numbers and incorrect
+    plots when re-running the script against an old output path).
 
-Both modes: hold/drive the same fixed line, compute cross-track error
-(perpendicular distance from the line) and along-track progress every tick,
-auto-stop on arrival at the end marker, and can optionally log every tick to
-CSV (now tagged with a "mode" column) for offline comparison.
-
-Low latency: opens ONE persistent gz-transport connection at startup
-(publishers + a pose subscriber) and reuses it for every tick. Needs the
-Python bindings package installed:
-
-    sudo apt install python3-gz-transport14   # or 13/12/15, see below
-
-If it can't find a working bindings install, it prints a warning and falls
-back to the old subprocess-per-call method for manual sliders only - the
-nav loop needs live pose feedback and won't run without the bindings.
-
-The param-tuning "Apply" button still uses the `gz service` CLI directly
-(subprocess), since that's a rare, one-off action.
-
-Requires the `gz` CLI on PATH.
+REQUIREMENTS
+    - `gz` CLI on PATH (same as main.py).
+    - gz-transport / gz-msgs python bindings (same as main.py):
+          sudo apt install python3-gz-transport14   # or 12/13/15
+    - matplotlib + numpy:
+          pip install matplotlib numpy --break-system-packages
+    - The constants below (WORLD_NAME, MODEL_NAME, joint names, file paths,
+      START_POINT/END_POINT) MUST match your main.py / world .sdf. They're
+      copied from your working main.py as of this writing - update both
+      files together if you ever change the world/model.
 
 USAGE
-    python3 main.py                          # random waves, auto-launches gz sim
-    python3 main.py --no-auto-launch         # attach to an already-running sim
-    python3 main.py --seed 42                # reproducible wave conditions
-    python3 main.py --wind-speed 3 9 --wind-angle 0 360 --steepness 0.5 2.5
+    python3 batch_test_runner.py
 """
 
-import argparse
+import atexit
 import csv
 import datetime
 import importlib
 import math
 import os
 import random
+import re
 import shutil
 import signal
 import subprocess
@@ -62,64 +66,90 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, messagebox
 
-# ---- Edit to match your world/model -------------------------------------
+# ============================================================================
+# Config copied from main.py - KEEP IN SYNC with your world/model setup.
+# ============================================================================
 WORLD_NAME = "water_test"
-MODEL_NAME = "rescue_float_robot"
-LEFT_JOINT = "leftmotor"
-RIGHT_JOINT = "rightmotor"
-SPAWN_POSE = "0 0 0.1 0 0 0"    # x y z roll pitch yaw
-HULL_SIZE = (1.0, 0.5, 0.2)     # x y z, must match collision/visual box
+MODEL_NAME = "test_boat"
+LEFT_JOINT = "left_thruster_joint"
+RIGHT_JOINT = "right_thruster_joint"
+BODY_YAW_OFFSET = 0.0  # test_boat spawns at yaw 0, local +X forward -> no correction
 
-BODY_YAW_OFFSET = -1.5708
-
-# ---- PID test path --------------------------------------------------------
-# MUST match the <pose> of start_marker / end_marker in the .world file.
-START_POINT = (0.0, 0.0)    # x, y (metres)
-END_POINT = (20.0, 0.0)     # x, y (metres)
-GOAL_RADIUS = 1.0           # metres; "arrived" tolerance around END_POINT
+START_POINT = (0.0, 0.0)
+END_POINT = (20.0, 0.0)
+GOAL_RADIUS = 1.0
 
 _dx = END_POINT[0] - START_POINT[0]
 _dy = END_POINT[1] - START_POINT[1]
 LINE_LENGTH = math.hypot(_dx, _dy)
-LINE_HEADING = math.atan2(_dy, _dx)                       # radians
-LINE_DIR = (_dx / LINE_LENGTH, _dy / LINE_LENGTH)          # unit vector A->B
+LINE_HEADING = math.atan2(_dy, _dx)
+LINE_DIR = (_dx / LINE_LENGTH, _dy / LINE_LENGTH)
 
-MAX_THRUST = 6.0          # N, safety clamp  (was 60.0)
-BASE_THRUST_DEFAULT = 2.5 # N                 (was 35.0)
-KP_DEFAULT = 4.0           # was 40.0
+MAX_THRUST = 6.0
+BASE_THRUST_DEFAULT = 2.5
+KP_DEFAULT = 4.0
 KI_DEFAULT = 0.0
-KD_DEFAULT = 0.8  
-KXTE_DEFAULT = 0.0       # optional cross-track feedback gain (N per metre); 0 = off
-TICK_MS = 50               # ~20 Hz control loop
+KD_DEFAULT = 0.8
+KXTE_DEFAULT = 0.0
 
-# Set True if running this script with native Windows Python while gz-sim
-# runs inside WSL. Routes subprocess `gz` calls (service calls, world
-# auto-launch, and the fallback publish path) through `wsl`. Leave False if
-# you're running with WSL's python3 directly (the common case).
-USE_WSL = False
-# ---------------------------------------------------------------------------
+# ---- Drift-rejection terms (react to sideways wave push directly, instead
+# of waiting for it to show up as heading error or accumulated cross-track
+# position error) ----
+# Kxte reacts to cross-track POSITION error (how far off the line you already
+# are). A perpendicular wave hit shows up there late - by the time cross-track
+# error has grown, the boat has already been pushed a long way sideways. The
+# two gains below react earlier, directly to the boat's sideways motion:
+#   KXTE_DOT   multiplies the (filtered) cross-track VELOCITY - how fast the
+#              boat is currently drifting sideways. This is the primary term
+#              to tune for "a beam wave shoves the boat but doesn't rotate
+#              it": a sideways velocity spike shows up in this term almost
+#              immediately, well before cross-track position error builds up,
+#              so it can start countering the drift right away.
+#   KXTE_DDOT  multiplies the (filtered) cross-track ACCELERATION - how
+#              abruptly that sideways push is changing. This is the more
+#              literal "acceleration pointing away from the robot" term, but
+#              acceleration is a second derivative of noisy position data, so
+#              it's inherently noisier/twitchier than the velocity term above.
+#              Leave at 0.0 unless KXTE_DOT alone isn't reacting fast enough.
+# Both are computed from a simple low-pass-filtered finite difference of
+# cross-track position (see DRIFT_FILTER_TAU_DEFAULT below) so they don't
+# just amplify simulation/sensor noise tick-to-tick.
+KXTE_DOT_DEFAULT = 0.0
+KXTE_DDOT_DEFAULT = 0.0
+DRIFT_FILTER_TAU_DEFAULT = 0.5  # seconds; larger = smoother but more lag
 
-# ---- Wave randomization + auto-launch (domain randomization for PID testing) ----
-AUTO_LAUNCH_WORLD = True   # default: randomize waves + start gz sim automatically
+TICK_S = 0.05  # ~20 Hz control loop
 
-# Keep these in sync with launch_randomized_world.py if you still use it
-# standalone (e.g. to pre-stage conditions and then run this with
-# --no-auto-launch).
+USE_WSL = False  # set True if gz sim runs in WSL but this script runs native Windows python
+
 WAVE_TEMPLATE_PATH = Path("/home/phusion/gz_ws/worlds/CrestWaterRobot/models/waves/model.sdf.template")
 WAVE_REAL_SDF_PATH = Path("/home/phusion/gz_ws/worlds/CrestWaterRobot/models/waves/model.sdf")
 WORLD_FILE_PATH = Path("/home/phusion/gz_ws/worlds/CrestWaterRobot/mainSimulation.sdf")
 
-# wind_speed intentionally stays clear of 0.26-0.39 m/s, a known asv_wave_sim
-# FFT instability band (upstream issue #172) - don't lower the minimum into it.
-WIND_SPEED_RANGE = (2.0, 9.0)      # m/s
-WIND_ANGLE_RANGE = (0.0, 360.0)    # degrees
-STEEPNESS_RANGE = (0.5, 3.0)
-
-GZ_BOOT_WAIT_S = 2.0  # seconds to sleep after launching gz sim before connecting bindings
+WIND_SPEED_RANGE_DEFAULT = (2.0, 9.0)
+WIND_ANGLE_RANGE_DEFAULT = (0.0, 360.0)
+STEEPNESS_RANGE_DEFAULT = (0.5, 3.0)
 
 POSE_TOPIC = f"/world/{WORLD_NAME}/dynamic_pose/info"
 LEFT_TOPIC = f"/model/{MODEL_NAME}/joint/{LEFT_JOINT}/cmd_thrust"
 RIGHT_TOPIC = f"/model/{MODEL_NAME}/joint/{RIGHT_JOINT}/cmd_thrust"
+
+CSV_FIELDS = [
+    "run", "seed", "wind_speed_mps", "wind_angle_deg", "steepness",
+    "mode", "max_abs_cross_track_m", "final_abs_cross_track_m",
+    "final_along_track_m", "arrived", "duration_s", "note",
+]
+
+# Per-tick time-series columns (one row per control-loop tick per phase).
+TS_CSV_FIELDS = [
+    "run", "mode", "t_s", "x_m", "y_m", "yaw_deg", "heading_error_deg",
+    "cross_track_m", "cross_track_vel_mps", "cross_track_accel_mps2",
+    "along_track_m", "left_thrust_N", "right_thrust_N",
+]
+
+# ============================================================================
+# Small helpers (same math as main.py)
+# ============================================================================
 
 
 def clamp(v, lo, hi):
@@ -139,12 +169,6 @@ def yaw_from_quat(x, y, z, w):
 
 
 def cross_along_track(x, y):
-    """Signed perpendicular distance (cross-track) and distance traveled
-    along the line (along-track), relative to START_POINT -> END_POINT.
-
-    Cross-track sign convention: positive = boat is to the LEFT of the line
-    when facing from START_POINT toward END_POINT; negative = to the right.
-    """
     px = x - START_POINT[0]
     py = y - START_POINT[1]
     along = px * LINE_DIR[0] + py * LINE_DIR[1]
@@ -153,8 +177,6 @@ def cross_along_track(x, y):
 
 
 def load_gz_bindings():
-    """Try known gz-transport/gz-msgs version pairings, newest first.
-    Returns (Node_class, Double_cls, PoseV_cls) or (None, None, None)."""
     candidates = [
         ("gz.transport", "gz.msgs"),
         ("gz.transport15", "gz.msgs12"),
@@ -180,16 +202,6 @@ def gz_cmd(args):
     return (["wsl", "--"] + args) if USE_WSL else args
 
 
-def gz_topic_pub_subprocess(topic: str, value: float) -> None:
-    try:
-        subprocess.run(
-            gz_cmd(["gz", "topic", "-t", topic, "-m", "gz.msgs.Double", "-p", f"data: {value}"]),
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-    except FileNotFoundError:
-        print("Could not find 'gz' (or 'wsl'). Check PATH / USE_WSL setting.")
-
-
 def gz_service(service: str, reqtype: str, reptype: str, req: str, timeout_ms=2000):
     try:
         return subprocess.run(
@@ -206,114 +218,12 @@ def gz_service(service: str, reqtype: str, reptype: str, req: str, timeout_ms=20
         return _Result()
 
 
-def box_inertia(mass: float, size):
-    x, y, z = size
-    ixx = mass * (y * y + z * z) / 12.0
-    iyy = mass * (x * x + z * z) / 12.0
-    izz = mass * (x * x + y * y) / 12.0
-    return ixx, iyy, izz
+# ============================================================================
+# Wave randomization (same mechanism as main.py)
+# ============================================================================
 
 
-def build_model_sdf(p: dict) -> str:
-    ixx, iyy, izz = box_inertia(p["mass"], HULL_SIZE)
-    x, y, z = HULL_SIZE
-    sdf = f"""
-<sdf version="1.9">
-<model name="{MODEL_NAME}">
-  <pose>{SPAWN_POSE}</pose>
-  <link name="hull">
-    <inertial>
-      <mass>{p['mass']}</mass>
-      <inertia><ixx>{ixx}</ixx><iyy>{iyy}</iyy><izz>{izz}</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
-    </inertial>
-    <collision name="collision"><geometry><box><size>{x} {y} {z}</size></box></geometry></collision>
-    <visual name="visual">
-      <geometry><box><size>{x} {y} {z}</size></box></geometry>
-      <material><ambient>0.8 0.2 0.2 1</ambient><diffuse>0.8 0.2 0.2 1</diffuse></material>
-    </visual>
-  </link>
-  <link name="left_prop">
-    <pose relative_to="hull">-0.55 0.2 0 0 1.5708 0</pose>
-    <inertial><mass>0.05</mass><inertia><ixx>1e-5</ixx><iyy>1e-5</iyy><izz>1e-5</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertial></inertial>
-    <visual name="visual"><geometry><cylinder><radius>0.04</radius><length>0.02</length></cylinder></geometry>
-      <material><ambient>0.1 0.1 0.1 1</ambient><diffuse>0.1 0.1 0.1 1</diffuse></material></visual>
-  </link>
-  <joint name="{LEFT_JOINT}" type="revolute">
-    <parent>hull</parent><child>left_prop</child>
-    <axis><xyz>0 0 1</xyz><limit><lower>-1e16</lower><upper>1e16</upper></limit></axis>
-  </joint>
-  <link name="right_prop">
-    <pose relative_to="hull">-0.55 -0.2 0 0 1.5708 0</pose>
-    <inertial><mass>0.05</mass><inertia><ixx>1e-5</ixx><iyy>1e-5</iyy><izz>1e-5</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertial></inertial>
-    <visual name="visual"><geometry><cylinder><radius>0.04</radius><length>0.02</length></cylinder></geometry>
-      <material><ambient>0.1 0.1 0.1 1</ambient><diffuse>0.1 0.1 0.1 1</diffuse></material></visual>
-  </link>
-  <joint name="{RIGHT_JOINT}" type="revolute">
-    <parent>hull</parent><child>right_prop</child>
-    <axis><xyz>0 0 1</xyz><limit><lower>-1e16</lower><upper>1e16</upper></limit></axis>
-  </joint>
-  <plugin filename="gz-sim-hydrodynamics-system" name="gz::sim::systems::Hydrodynamics">
-    <link_name>hull</link_name>
-    <xU>{p['xU']}</xU><xUabsU>{p['xUabsU']}</xUabsU>
-    <yV>{p['yV']}</yV><yVabsV>{p['yVabsV']}</yVabsV>
-    <zW>{p['zW']}</zW><zWabsW>{p['zWabsW']}</zWabsW>
-    <kP>{p['kP']}</kP><kPabsP>{p['kPabsP']}</kPabsP>
-    <mQ>{p['mQ']}</mQ><mQabsQ>{p['mQabsQ']}</mQabsQ>
-    <nR>{p['nR']}</nR><nRabsR>{p['nRabsR']}</nRabsR>
-  </plugin>
-  <plugin filename="gz-sim-thruster-system" name="gz::sim::systems::Thruster">
-    <joint_name>{LEFT_JOINT}</joint_name>
-    <thrust_coefficient>{p['thrust_coefficient']}</thrust_coefficient>
-    <fluid_density>{p['fluid_density']}</fluid_density>
-    <propeller_diameter>{p['propeller_diameter']}</propeller_diameter>
-  </plugin>
-  <plugin filename="gz-sim-thruster-system" name="gz::sim::systems::Thruster">
-    <joint_name>{RIGHT_JOINT}</joint_name>
-    <thrust_coefficient>{p['thrust_coefficient']}</thrust_coefficient>
-    <fluid_density>{p['fluid_density']}</fluid_density>
-    <propeller_diameter>{p['propeller_diameter']}</propeller_diameter>
-  </plugin>
-</model>
-</sdf>
-""".strip()
-    return sdf.replace("\n", " ").replace('"', '\\"')
-
-
-def respawn(p: dict) -> str:
-    remove_req = f'name: "{MODEL_NAME}" type: MODEL'
-    r1 = gz_service(f"/world/{WORLD_NAME}/remove", "gz.msgs.Entity", "gz.msgs.Boolean", remove_req)
-
-    sdf_inline = build_model_sdf(p)
-    create_req = f'sdf: "{sdf_inline}"'
-    r2 = gz_service(f"/world/{WORLD_NAME}/create", "gz.msgs.EntityFactory", "gz.msgs.Boolean", create_req)
-
-    return (
-        f"remove: rc={r1.returncode} {r1.stdout.strip()} {r1.stderr.strip()}\n"
-        f"create: rc={r2.returncode} {r2.stdout.strip()} {r2.stderr.strip()}"
-    )
-
-
-PARAM_FIELDS = [
-    ("mass", "0.8"),
-    ("thrust_coefficient", "0.005"),
-    ("fluid_density", "1000"),
-    ("propeller_diameter", "0.08"),
-    ("xU", "-5"), ("xUabsU", "-10"),
-    ("yV", "-10"), ("yVabsV", "-20"),
-    ("zW", "-10"), ("zWabsW", "-20"),
-    ("kP", "-4"), ("kPabsP", "-8"),
-    ("mQ", "-4"), ("mQabsQ", "-8"),
-    ("nR", "-2"), ("nRabsR", "-4"),
-]
-
-
-# ---- Wave randomization + world auto-launch --------------------------------
-def randomize_and_write_wave_model(wind_speed_range=WIND_SPEED_RANGE, wind_angle_range=WIND_ANGLE_RANGE,
-                                    steepness_range=STEEPNESS_RANGE, seed=None):
-    """Pick random wave params and write them into the real waves model .sdf
-    file. The gz-waves plugin only reads these at world load, so this MUST
-    run before gz sim starts. Returns (seed, wind_speed, wind_angle,
-    steepness), or None if the template/model paths aren't set up yet."""
+def randomize_and_write_wave_model(wind_speed_range, wind_angle_range, steepness_range, seed=None):
     if not WAVE_TEMPLATE_PATH.exists():
         print(f"Wave template not found at {WAVE_TEMPLATE_PATH} - skipping wave randomization.")
         return None
@@ -324,9 +234,8 @@ def randomize_and_write_wave_model(wind_speed_range=WIND_SPEED_RANGE, wind_angle
     backup_path = WAVE_REAL_SDF_PATH.with_suffix(WAVE_REAL_SDF_PATH.suffix + ".orig_bak")
     if WAVE_REAL_SDF_PATH.exists() and not backup_path.exists():
         shutil.copy2(WAVE_REAL_SDF_PATH, backup_path)
-        print(f"Backed up existing wave model to {backup_path}")
 
-    used_seed = seed if seed is not None else random.SystemRandom().randrange(2**31)
+    used_seed = seed if seed is not None else random.SystemRandom().randrange(2 ** 31)
     rng = random.Random(used_seed)
     wind_speed = rng.uniform(*wind_speed_range)
     wind_angle = rng.uniform(*wind_angle_range)
@@ -341,39 +250,73 @@ def randomize_and_write_wave_model(wind_speed_range=WIND_SPEED_RANGE, wind_angle
     WAVE_REAL_SDF_PATH.write_text(text)
 
     stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    summary = (f"[{stamp}] seed={used_seed}  wind_speed={wind_speed:.3f} m/s  "
-               f"wind_angle_deg={wind_angle:.2f}  steepness={steepness:.3f}")
-    print(summary)
-    log_path = WAVE_REAL_SDF_PATH.parent.parent / "wave_run_log.txt"
-    try:
-        with open(log_path, "a") as f:
-            f.write(summary + "\n")
-    except OSError:
-        pass
+    print(f"[{stamp}] seed={used_seed}  wind_speed={wind_speed:.3f} m/s  "
+          f"wind_angle_deg={wind_angle:.2f}  steepness={steepness:.3f}")
 
     return used_seed, wind_speed, wind_angle, steepness
 
 
-def launch_world_background():
-    """Starts gz sim as a background (non-blocking) process. Returns the
-    Popen handle so it can be cleaned up when the GUI closes, or None if it
-    couldn't be started."""
-    if not WORLD_FILE_PATH.exists():
-        print(f"World file not found at {WORLD_FILE_PATH} - not auto-launching gz sim.")
+def patch_real_time_factor(new_rtf):
+    """Temporarily override <real_time_factor> in the world file to speed
+    the whole batch up. Returns a backup Path to restore from, or None if
+    no change was made."""
+    if new_rtf is None or abs(new_rtf - 1.0) < 1e-9:
         return None
-    cmd = gz_cmd(["gz", "sim", "-r", str(WORLD_FILE_PATH)])
-    print(f"Auto-launching: {' '.join(cmd)}")
+    if not WORLD_FILE_PATH.exists():
+        print(f"World file not found at {WORLD_FILE_PATH} - cannot patch real_time_factor.")
+        return None
+    backup_path = WORLD_FILE_PATH.with_suffix(WORLD_FILE_PATH.suffix + ".rtf_bak")
+    text = WORLD_FILE_PATH.read_text()
+    if not backup_path.exists():
+        backup_path.write_text(text)
+    new_text = re.sub(
+        r"<real_time_factor>[^<]*</real_time_factor>",
+        f"<real_time_factor>{new_rtf}</real_time_factor>",
+        text,
+    )
+    WORLD_FILE_PATH.write_text(new_text)
+    print(f"Patched real_time_factor to {new_rtf} (backup at {backup_path})")
+    return backup_path
+
+
+def restore_real_time_factor(backup_path):
+    if backup_path is not None and backup_path.exists():
+        WORLD_FILE_PATH.write_text(backup_path.read_text())
+        print("Restored original real_time_factor.")
+
+
+# ============================================================================
+# gz sim process management
+# ============================================================================
+
+_active_gz_proc = None
+
+
+def launch_world_background(headless=True):
+    global _active_gz_proc
+    if not WORLD_FILE_PATH.exists():
+        print(f"World file not found at {WORLD_FILE_PATH} - not launching gz sim.")
+        return None
+    args = ["gz", "sim", "-r"]
+    if headless:
+        args.append("-s")
+    args.append(str(WORLD_FILE_PATH))
+    cmd = gz_cmd(args)
+    print(f"  Launching: {' '.join(cmd)}")
     kwargs = {}
     if os.name == "posix":
-        kwargs["preexec_fn"] = os.setsid  # lets us kill the whole process group later
+        kwargs["preexec_fn"] = os.setsid
     try:
-        return subprocess.Popen(cmd, **kwargs)
+        proc = subprocess.Popen(cmd, **kwargs)
+        _active_gz_proc = proc
+        return proc
     except FileNotFoundError:
-        print("Could not find 'gz' (or 'wsl'). Check PATH / USE_WSL setting - not auto-launching.")
+        print("Could not find 'gz' (or 'wsl'). Check PATH / USE_WSL setting.")
         return None
 
 
 def terminate_gz_process(proc):
+    global _active_gz_proc
     if proc is None:
         return
     try:
@@ -381,341 +324,1291 @@ def terminate_gz_process(proc):
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         else:
             proc.terminate()
-    except (ProcessLookupError, PermissionError):
+        proc.wait(timeout=5)
+    except Exception:
         pass
-    except Exception as e:
-        print(f"Could not terminate gz sim process cleanly: {e}")
+    if _active_gz_proc is proc:
+        _active_gz_proc = None
 
 
-class App(tk.Tk):
-    def __init__(self, gz_process=None, wave_info=None):
-        super().__init__()
-        self.title(f"Boat control — {MODEL_NAME}")
-        self._gz_process = gz_process
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
+def _cleanup_on_exit():
+    terminate_gz_process(_active_gz_proc)
 
-        self.have_bindings = NodeCls is not None
-        self.current_yaw = None       # radians, updated by pose subscriber
-        self.current_x = None         # metres, updated by pose subscriber
-        self.current_y = None         # metres, updated by pose subscriber
-        self.target_yaw = None
-        self.nav_active = False
-        self.active_mode = None       # "pid" or "normal" while running
-        self.nav_start_time = None
-        self.integral = 0.0
-        self.prev_error = 0.0
-        self.left_thrust = 0.0
-        self.right_thrust = 0.0
-        self.log_file = None
-        self.log_writer = None
 
-        if self.have_bindings:
-            self.node = NodeCls()
-            self.pub_left = self.node.advertise(LEFT_TOPIC, DoubleMsg)
-            self.pub_right = self.node.advertise(RIGHT_TOPIC, DoubleMsg)
-            ok = self.node.subscribe(PoseVMsg, POSE_TOPIC, self._on_pose)
-            if not ok:
-                print(f"Warning: failed to subscribe to {POSE_TOPIC}")
-        else:
-            print(
-                "gz-transport Python bindings not found - falling back to slower "
-                "subprocess publishing, and nav is disabled (no live pose "
-                "feedback). Try: sudo apt install python3-gz-transport14 "
-                "(or python3-gz-transport13 / 12 / 15, whichever matches your install)."
-            )
+atexit.register(_cleanup_on_exit)
 
-        # --- status banners -------------------------------------------------
-        banner = "fast (gz-transport bindings)" if self.have_bindings else "SLOW fallback (subprocess) - install bindings, see console"
-        ttk.Label(self, text=f"Publish path: {banner}").grid(row=0, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 0))
-        ttk.Label(
-            self,
-            text=(f"Path: ({START_POINT[0]:.1f}, {START_POINT[1]:.1f}) -> "
-                  f"({END_POINT[0]:.1f}, {END_POINT[1]:.1f})   "
-                  f"length {LINE_LENGTH:.1f} m   bearing {math.degrees(LINE_HEADING):.1f} deg")
-        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=8)
-        if wave_info:
-            ttk.Label(self, text=wave_info).grid(row=2, column=0, columnspan=2, sticky="w", padx=8)
 
-        # --- Navigation panel ----------------------------------------------
-        nav = ttk.LabelFrame(self, text="Navigation: PID vs Normal (no controller) comparison")
-        nav.grid(row=3, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
+def reset_world(world_name):
+    """WorldControl reset: teleports models back to their spawn pose and
+    resets sim time to 0, WITHOUT restarting the gz sim process - so the
+    wave field / wind conditions stay identical between the No-PID and PID
+    phases of the same run."""
+    req = "reset: {all: true}"
+    result = gz_service(f"/world/{world_name}/control", "gz.msgs.WorldControl", "gz.msgs.Boolean", req)
+    if getattr(result, "returncode", -1) != 0:
+        print(f"  WARNING: world reset call failed: {getattr(result, 'stderr', '').strip()}")
+    return result
 
-        self.mode_var = tk.StringVar(value="pid")
-        mode_frame = ttk.Frame(nav)
-        mode_frame.grid(row=0, column=0, padx=4, pady=4, sticky="w")
-        self.mode_radio_pid = ttk.Radiobutton(mode_frame, text="PID", variable=self.mode_var, value="pid")
-        self.mode_radio_pid.pack(side="left")
-        self.mode_radio_normal = ttk.Radiobutton(mode_frame, text="Normal (const thrust)", variable=self.mode_var, value="normal")
-        self.mode_radio_normal.pack(side="left")
 
-        self.nav_btn = ttk.Button(nav, text="Start", command=self.toggle_nav,
-                                   state=("normal" if self.have_bindings else "disabled"))
-        self.nav_btn.grid(row=0, column=1, padx=4, pady=4)
+# ============================================================================
+# Pose tracking
+# ============================================================================
 
-        self.kp_var = tk.StringVar(value=str(KP_DEFAULT))
-        self.ki_var = tk.StringVar(value=str(KI_DEFAULT))
-        self.kd_var = tk.StringVar(value=str(KD_DEFAULT))
-        self.kxte_var = tk.StringVar(value=str(KXTE_DEFAULT))
-        self.base_var = tk.StringVar(value=str(BASE_THRUST_DEFAULT))
-        for i, (label, var) in enumerate([("Kp", self.kp_var), ("Ki", self.ki_var),
-                                           ("Kd", self.kd_var), ("Kxte", self.kxte_var),
-                                           ("Base thrust N", self.base_var)]):
-            ttk.Label(nav, text=label).grid(row=0, column=2 + 2 * i, sticky="e")
-            ttk.Entry(nav, textvariable=var, width=8).grid(row=0, column=3 + 2 * i, padx=(0, 6))
-        # Note: Kp/Ki/Kd/Kxte are ignored in Normal mode - only "Base thrust N"
-        # applies there, so both modes can be compared at the same base thrust.
 
-        self.log_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(nav, text="Log to CSV", variable=self.log_var).grid(
-            row=0, column=2 + 2 * 5, padx=(6, 0)
-        )
+class PoseState:
+    def __init__(self):
+        self.x = None
+        self.y = None
+        self.yaw = None
+        self.last_update = None
+        self._logged_names = False
 
-        self.nav_status = tk.Label(
-            nav, text="not running", width=78, height=4, justify="left",
-            relief="sunken", bg="#222", fg="#0f0", font=("Courier", 10), anchor="w",
-        )
-        self.nav_status.grid(row=1, column=0, columnspan=13, padx=6, pady=6, sticky="w")
-
-        # --- Manual thrust sliders (used only while nav is stopped) --------
-        manual = ttk.LabelFrame(self, text="Manual thrust (only while nav is stopped)")
-        manual.grid(row=4, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
-        self.left_val = tk.DoubleVar()
-        self.right_val = tk.DoubleVar()
-        ttk.Label(manual, text="Left N").grid(row=0, column=0, sticky="w")
-        self.left_scale = ttk.Scale(manual, from_=-MAX_THRUST, to=MAX_THRUST, variable=self.left_val,
-                                     command=lambda _=None: self.set_thrust(self.left_val.get(), self.right_val.get()),
-                                     length=300)
-        self.left_scale.grid(row=1, column=0)
-        ttk.Label(manual, text="Right N").grid(row=2, column=0, sticky="w")
-        self.right_scale = ttk.Scale(manual, from_=-MAX_THRUST, to=MAX_THRUST, variable=self.right_val,
-                                      command=lambda _=None: self.set_thrust(self.left_val.get(), self.right_val.get()),
-                                      length=300)
-        self.right_scale.grid(row=3, column=0)
-
-        # --- Param tuning panel ----------------------------------------------
-        param_frame = ttk.LabelFrame(self, text="Boat params (Apply = remove + respawn model)")
-        param_frame.grid(row=5, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
-        self.entries = {}
-        for i, (name, default) in enumerate(PARAM_FIELDS):
-            ttk.Label(param_frame, text=name).grid(row=i, column=0, sticky="w")
-            e = ttk.Entry(param_frame, width=12)
-            e.insert(0, default)
-            e.grid(row=i, column=1)
-            self.entries[name] = e
-
-        ttk.Button(self, text="Apply (respawn boat)", command=self.apply_params).grid(
-            row=6, column=0, columnspan=2, pady=6
-        )
-        self.status = tk.Text(self, height=4, width=78)
-        self.status.grid(row=7, column=0, columnspan=2, padx=8, pady=8)
-
-        self.after(TICK_MS, self.tick)
-
-    # ---- lifecycle ------------------------------------------------------
-    def on_close(self):
-        self._close_log()
-        terminate_gz_process(self._gz_process)
-        self.destroy()
-
-    # ---- pose feedback (runs on gz-transport's callback thread) -------
-    def _on_pose(self, msg):
+    def callback(self, msg):
+        self.last_update = time.time()
+        if not self._logged_names:
+            names = sorted({p.name for p in msg.pose})
+            print(f"  [pose] entities seen on topic: {names}")
+            if MODEL_NAME not in names:
+                print(f"  [pose] WARNING: '{MODEL_NAME}' not in that list - check MODEL_NAME.")
+            self._logged_names = True
         for pose in msg.pose:
             if pose.name == MODEL_NAME:
                 q = pose.orientation
-                raw_yaw = yaw_from_quat(q.x, q.y, q.z, q.w)
-                self.current_yaw = wrap_pi(raw_yaw - BODY_YAW_OFFSET)
-                self.current_x = pose.position.x
-                self.current_y = pose.position.y
+                self.yaw = wrap_pi(yaw_from_quat(q.x, q.y, q.z, q.w) - BODY_YAW_OFFSET)
+                self.x = pose.position.x
+                self.y = pose.position.y
                 return
 
-    # ---- navigation -----------------------------------------------------
-    def toggle_nav(self):
-        if not self.nav_active:
-            if self.current_yaw is None or self.current_x is None or self.current_y is None:
-                messagebox.showinfo("Waiting for pose", "No pose data yet - is the sim running and unpaused?")
-                return
-            self.active_mode = self.mode_var.get()  # "pid" or "normal", locked in for this run
-            # Hold the FIXED line bearing (start -> end), not just whatever
-            # heading the boat happens to be facing right now.
-            self.target_yaw = LINE_HEADING
-            self.integral = 0.0
-            self.prev_error = 0.0
-            self.nav_start_time = time.time()
-            self.nav_active = True
-            self.nav_btn.config(text="Stop")
-            self.left_scale.state(["disabled"])
-            self.right_scale.state(["disabled"])
-            self.mode_radio_pid.state(["disabled"])
-            self.mode_radio_normal.state(["disabled"])
-            self._open_log_if_requested()
-        else:
-            self._stop_nav("stopped by user")
 
-    def _open_log_if_requested(self):
-        if not self.log_var.get():
-            return
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(os.getcwd(), f"run_{self.active_mode}_{ts}.csv")
-        try:
-            self.log_file = open(path, "w", newline="")
-            self.log_writer = csv.writer(self.log_file)
-            self.log_writer.writerow([
-                "mode", "t_s", "x_m", "y_m", "yaw_deg", "target_yaw_deg",
-                "heading_error_deg", "cross_track_m", "along_track_m",
-                "left_thrust_N", "right_thrust_N",
-            ])
-            print(f"Logging {self.active_mode} run to {path}")
-        except OSError as e:
-            print(f"Could not open log file: {e}")
-            self.log_file = None
-            self.log_writer = None
+def wait_for_pose(state, timeout=15.0, want_reset_near_start=False):
+    start = time.time()
+    while True:
+        if state.x is not None:
+            if not want_reset_near_start:
+                return True
+            # after a world reset, wait until the pose actually reflects
+            # the boat being back near the start point
+            _, along = cross_along_track(state.x, state.y)
+            if abs(along) < 0.5:
+                return True
+        if time.time() - start > timeout:
+            return state.x is not None
+        time.sleep(0.1)
 
-    def _close_log(self):
-        if self.log_file is not None:
-            self.log_file.close()
-            self.log_file = None
-            self.log_writer = None
 
-    def _stop_nav(self, reason: str):
-        self.nav_active = False
-        self.nav_btn.config(text="Start")
-        self.left_scale.state(["!disabled"])
-        self.right_scale.state(["!disabled"])
-        self.mode_radio_pid.state(["!disabled"])
-        self.mode_radio_normal.state(["!disabled"])
-        self.set_thrust(0.0, 0.0)
-        self._close_log()
-        mode_label = "PID" if self.active_mode == "pid" else "Normal"
-        self.nav_status.config(text=f"[{mode_label}] stopped: {reason}")
-        self.active_mode = None
+# ============================================================================
+# Control loop for one phase (no_pid / pid)
+# ============================================================================
 
-    def run_control_tick(self, dt):
-        cross, along = cross_along_track(self.current_x, self.current_y)
 
-        # Arrived at the end marker -> stop (same criterion for both modes).
-        if along >= LINE_LENGTH - GOAL_RADIUS:
-            self._stop_nav(
-                f"reached end point (along={along:.2f} m, cross-track={cross:+.2f} m)"
-            )
-            return
+def run_phase(state, pub_left, pub_right, mode, cfg, run_idx):
+    """Runs one phase (no_pid or pid) and returns (metrics dict, records
+    list). `records` holds one dict per control-loop tick with position,
+    heading, cross/along-track error and thrust - used for the time-series
+    plots. heading_error is computed (and logged) in BOTH modes, even
+    though only the pid mode actually uses it for control, so the two
+    modes can be compared on the same time-series plots.
 
-        try:
-            base = float(self.base_var.get())
-        except ValueError:
-            self.nav_status.config(text="Bad base thrust value")
-            return
+    DRIFT (BEAM-WAVE) REJECTION: besides the heading-error PID and the
+    cross-track POSITION term (Kxte), this also estimates how fast the boat
+    is currently being pushed sideways - its cross-track VELOCITY - and,
+    optionally, how abruptly that push is changing - cross-track
+    ACCELERATION. A wave hitting the boat from the side can shove it
+    sideways a lot without rotating it much, so heading error alone reacts
+    late; the velocity/acceleration terms let the controller start steering
+    into the drift as soon as it starts, rather than waiting for it to turn
+    into a large heading or position error. Both are derived from a simple
+    low-pass-filtered finite difference of the cross-track position
+    (time constant cfg["drift_tau"]) so tick-to-tick position noise doesn't
+    get amplified into a jittery correction."""
+    integral = 0.0
+    prev_error = 0.0
+    max_abs_cross = 0.0
+    last_cross = 0.0
+    along = 0.0
+    start_time = time.time()
+    last_tick = start_time
+    arrived = False
+    target_yaw = LINE_HEADING
+    records = []
 
-        heading_error = wrap_pi(self.target_yaw - self.current_yaw)
+    # Drift-estimation state (filtered cross-track velocity/acceleration).
+    prev_cross = None
+    filt_cross_vel = 0.0
+    prev_filt_cross_vel = 0.0
+    filt_cross_accel = 0.0
+    drift_tau = cfg.get("drift_tau", DRIFT_FILTER_TAU_DEFAULT)
 
-        if self.active_mode == "normal":
-            # No controller: both thrusters run at the same constant speed
-            # the whole time, regardless of heading or cross-track drift.
-            # This is the baseline PID is compared against.
-            left = right = clamp(base, 0.0, MAX_THRUST)
-        else:
-            try:
-                kp, ki, kd = float(self.kp_var.get()), float(self.ki_var.get()), float(self.kd_var.get())
-                kxte = float(self.kxte_var.get())
-            except ValueError:
-                self.nav_status.config(text="Bad Kp/Ki/Kd/Kxte value")
-                return
-            self.integral += heading_error * dt
-            derivative = (heading_error - self.prev_error) / dt if dt > 0 else 0.0
-            self.prev_error = heading_error
-            # Heading PID + optional cross-track feedback (line-of-sight
-            # style). If the boat is left of the line (cross > 0), steer
-            # right to converge back. Kxte defaults to 0 (pure heading-hold).
-            correction = kp * heading_error + ki * self.integral + kd * derivative - kxte * cross
-            # positive correction -> turn left -> more thrust on the right
-            # side, less on the left.
-            left = clamp(base - correction, 0.0, MAX_THRUST)
-            right = clamp(base + correction, 0.0, MAX_THRUST)
-
-        self.set_thrust(left, right)
-
-        elapsed = time.time() - self.nav_start_time if self.nav_start_time else 0.0
-        mode_label = "PID" if self.active_mode == "pid" else "Normal"
-        self.nav_status.config(text=(
-            f"[{mode_label}]  t={elapsed:6.1f}s  progress {along:6.2f} / {LINE_LENGTH:.1f} m\n"
-            f"heading {math.degrees(self.current_yaw):7.1f} deg  target {math.degrees(self.target_yaw):7.1f} deg  "
-            f"error {math.degrees(heading_error):+6.1f} deg\n"
-            f"cross-track {cross:+6.2f} m (sign: + = left of line)\n"
-            f"left {self.left_thrust:6.1f} N   right {self.right_thrust:6.1f} N"
-        ))
-
-        if self.log_writer is not None:
-            self.log_writer.writerow([
-                self.active_mode,
-                f"{elapsed:.3f}", f"{self.current_x:.3f}", f"{self.current_y:.3f}",
-                f"{math.degrees(self.current_yaw):.2f}", f"{math.degrees(self.target_yaw):.2f}",
-                f"{math.degrees(heading_error):.2f}", f"{cross:.3f}", f"{along:.3f}",
-                f"{self.left_thrust:.2f}", f"{self.right_thrust:.2f}",
-            ])
-
-    # ---- thrust output (fast path via bindings, fallback via subprocess) --
-    def set_thrust(self, left, right):
-        self.left_thrust = clamp(left, -MAX_THRUST, MAX_THRUST)
-        self.right_thrust = clamp(right, -MAX_THRUST, MAX_THRUST)
-        if self.have_bindings:
-            lmsg, rmsg = DoubleMsg(), DoubleMsg()
-            lmsg.data, rmsg.data = self.left_thrust, self.right_thrust
-            self.pub_left.publish(lmsg)
-            self.pub_right.publish(rmsg)
-        else:
-            gz_topic_pub_subprocess(LEFT_TOPIC, self.left_thrust)
-            gz_topic_pub_subprocess(RIGHT_TOPIC, self.right_thrust)
-
-    def tick(self):
+    while True:
         now = time.time()
-        dt = now - getattr(self, "_last_tick", now)
-        self._last_tick = now
-        if self.nav_active and self.current_yaw is not None and self.current_x is not None:
-            self.run_control_tick(dt if dt > 0 else TICK_MS / 1000.0)
-        self.after(TICK_MS, self.tick)
+        dt = now - last_tick if now > last_tick else TICK_S
+        last_tick = now
+        elapsed = now - start_time
 
-    # ---- param tuning -------------------------------------------------
-    def apply_params(self):
+        if elapsed > cfg["timeout_s"]:
+            break
+
+        if state.x is None:
+            time.sleep(TICK_S)
+            continue
+
+        cross, along = cross_along_track(state.x, state.y)
+        max_abs_cross = max(max_abs_cross, abs(cross))
+        # Tracked on every tick (even the final one, which may break out
+        # below before being appended to `records`) so callers can report
+        # the FINAL path divergence at the end of the run, not just the
+        # worst-case divergence seen at any point during it.
+        last_cross = cross
+
+        if along >= LINE_LENGTH - GOAL_RADIUS:
+            arrived = True
+            break
+
+        heading_error = wrap_pi(target_yaw - state.yaw) if state.yaw is not None else None
+
+        # ---- Estimate filtered cross-track velocity/acceleration --------
+        # (computed every tick, in both modes, so no_pid vs pid plots stay
+        # comparable - only pid mode actually feeds it back into thrust).
+        raw_cross_vel = 0.0 if prev_cross is None else (cross - prev_cross) / dt if dt > 0 else 0.0
+        prev_cross = cross
+        alpha_v = dt / (drift_tau + dt) if (drift_tau + dt) > 0 else 1.0
+        prev_filt_cross_vel = filt_cross_vel
+        filt_cross_vel += alpha_v * (raw_cross_vel - filt_cross_vel)
+
+        raw_cross_accel = (filt_cross_vel - prev_filt_cross_vel) / dt if dt > 0 else 0.0
+        alpha_a = alpha_v  # reuse the same time-constant-derived smoothing factor
+        filt_cross_accel += alpha_a * (raw_cross_accel - filt_cross_accel)
+
+        if mode == "no_pid":
+            left = right = clamp(cfg["base_thrust"], 0.0, MAX_THRUST)
+        else:
+            integral += (heading_error or 0.0) * dt
+            derivative = ((heading_error or 0.0) - prev_error) / dt if dt > 0 else 0.0
+            prev_error = heading_error or 0.0
+            correction = (cfg["kp"] * (heading_error or 0.0) + cfg["ki"] * integral +
+                          cfg["kd"] * derivative - cfg["kxte"] * cross -
+                          cfg.get("kxte_dot", 0.0) * filt_cross_vel -
+                          cfg.get("kxte_ddot", 0.0) * filt_cross_accel)
+            left = clamp(cfg["base_thrust"] - correction, 0.0, MAX_THRUST)
+            right = clamp(cfg["base_thrust"] + correction, 0.0, MAX_THRUST)
+
+        records.append({
+            "t": elapsed,
+            "x": state.x,
+            "y": state.y,
+            "yaw_deg": math.degrees(state.yaw) if state.yaw is not None else float("nan"),
+            "heading_error_deg": math.degrees(heading_error) if heading_error is not None else float("nan"),
+            "cross_track_m": cross,
+            "cross_track_vel_mps": filt_cross_vel,
+            "cross_track_accel_mps2": filt_cross_accel,
+            "along_track_m": along,
+            "left_thrust_N": left,
+            "right_thrust_N": right,
+        })
+
+        lmsg, rmsg = DoubleMsg(), DoubleMsg()
+        lmsg.data, rmsg.data = left, right
+        pub_left.publish(lmsg)
+        pub_right.publish(rmsg)
+
+        print(f"\r  run {run_idx} [{mode:6s}] t={elapsed:6.1f}s along={along:6.2f}/{LINE_LENGTH:.1f}m "
+              f"cross={cross:+6.2f}m (max {max_abs_cross:.2f}m)   ", end="", flush=True)
+
+        time.sleep(TICK_S)
+
+    # stop thrusters at the end of the phase
+    lmsg, rmsg = DoubleMsg(), DoubleMsg()
+    lmsg.data = rmsg.data = 0.0
+    pub_left.publish(lmsg)
+    pub_right.publish(rmsg)
+    print()
+
+    duration = time.time() - start_time
+    metrics = {
+        "max_abs_cross_track_m": max_abs_cross,
+        "final_abs_cross_track_m": abs(last_cross),
+        "final_along_track_m": along,
+        "arrived": arrived,
+        "duration_s": duration,
+    }
+    return metrics, records
+
+
+# ============================================================================
+# CSV logging
+# ============================================================================
+
+
+def append_csv_row(csv_path, run_idx, seed, wind_speed, wind_angle, steepness, mode,
+                    max_abs_cross_track_m=None, final_abs_cross_track_m=None,
+                    final_along_track_m=None,
+                    arrived=None, duration_s=None, note=""):
+    write_header = not os.path.exists(csv_path)
+
+    def fmt(v, digits=4):
+        return f"{v:.{digits}f}" if isinstance(v, float) and v == v else ("" if v is None else v)
+
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({
+            "run": run_idx,
+            "seed": seed,
+            "wind_speed_mps": fmt(wind_speed, 3),
+            "wind_angle_deg": fmt(wind_angle, 2),
+            "steepness": fmt(steepness, 3),
+            "mode": mode,
+            "max_abs_cross_track_m": fmt(max_abs_cross_track_m, 4),
+            "final_abs_cross_track_m": fmt(final_abs_cross_track_m, 4),
+            "final_along_track_m": fmt(final_along_track_m, 4),
+            "arrived": arrived,
+            "duration_s": fmt(duration_s, 2),
+            "note": note,
+        })
+
+
+def append_timeseries_rows(csv_path, run_idx, mode, records):
+    """Appends one row per tick from run_phase()'s `records` list. Header
+    is written once, the first time this file is touched in the batch (the
+    file is deleted at the start of main() so this is safe)."""
+    if not records:
+        return
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=TS_CSV_FIELDS)
+        if write_header:
+            writer.writeheader()
+        for rec in records:
+            writer.writerow({
+                "run": run_idx,
+                "mode": mode,
+                "t_s": f"{rec['t']:.3f}",
+                "x_m": f"{rec['x']:.4f}",
+                "y_m": f"{rec['y']:.4f}",
+                "yaw_deg": f"{rec['yaw_deg']:.3f}",
+                "heading_error_deg": f"{rec['heading_error_deg']:.3f}",
+                "cross_track_m": f"{rec['cross_track_m']:.4f}",
+                "cross_track_vel_mps": f"{rec['cross_track_vel_mps']:.4f}",
+                "cross_track_accel_mps2": f"{rec['cross_track_accel_mps2']:.4f}",
+                "along_track_m": f"{rec['along_track_m']:.4f}",
+                "left_thrust_N": f"{rec['left_thrust_N']:.3f}",
+                "right_thrust_N": f"{rec['right_thrust_N']:.3f}",
+            })
+
+
+# ============================================================================
+# One full run: wave randomization -> launch -> no_pid -> reset -> pid -> kill
+# ============================================================================
+
+
+def run_single(run_idx, run_seed, cfg, csv_path, ts_csv_path):
+    print(f"\n=== Run {run_idx}/{cfg['num_runs']}  (seed={run_seed}) ===")
+
+    wave_result = randomize_and_write_wave_model(
+        cfg["wind_speed_range"], cfg["wind_angle_range"], cfg["steepness_range"], seed=run_seed
+    )
+    if wave_result:
+        used_seed, wind_speed, wind_angle, steepness = wave_result
+    else:
+        used_seed, wind_speed, wind_angle, steepness = run_seed, float("nan"), float("nan"), float("nan")
+
+    proc = launch_world_background(headless=cfg["headless"])
+    if proc is None:
+        print(f"  Skipping run {run_idx}: could not launch gz sim.")
+        append_csv_row(csv_path, run_idx, used_seed, wind_speed, wind_angle, steepness,
+                        "no_pid", note="launch_failed")
+        append_csv_row(csv_path, run_idx, used_seed, wind_speed, wind_angle, steepness,
+                        "pid", note="launch_failed")
+        return
+
+    time.sleep(cfg["gz_boot_wait_s"])
+
+    node = NodeCls()
+    pub_left = node.advertise(LEFT_TOPIC, DoubleMsg)
+    pub_right = node.advertise(RIGHT_TOPIC, DoubleMsg)
+    state = PoseState()
+    ok = node.subscribe(PoseVMsg, POSE_TOPIC, state.callback)
+    if not ok:
+        print(f"  WARNING: failed to subscribe to {POSE_TOPIC}")
+
+    if not wait_for_pose(state, timeout=15.0):
+        print(f"  Run {run_idx}: never received pose data on {POSE_TOPIC} - aborting this run.")
+        terminate_gz_process(proc)
+        time.sleep(1.0)
+        append_csv_row(csv_path, run_idx, used_seed, wind_speed, wind_angle, steepness,
+                        "no_pid", note="no_pose_data")
+        append_csv_row(csv_path, run_idx, used_seed, wind_speed, wind_angle, steepness,
+                        "pid", note="no_pose_data")
+        return
+
+    # ---- Phase 1: No PID (constant thrust baseline) -----------------------
+    metrics_no_pid, records_no_pid = run_phase(state, pub_left, pub_right, "no_pid", cfg, run_idx)
+    append_csv_row(csv_path, run_idx, used_seed, wind_speed, wind_angle, steepness,
+                    "no_pid", **metrics_no_pid)
+    append_timeseries_rows(ts_csv_path, run_idx, "no_pid", records_no_pid)
+    print(f"  no_pid: max|cross|={metrics_no_pid['max_abs_cross_track_m']:.2f} m  "
+          f"arrived={metrics_no_pid['arrived']}  t={metrics_no_pid['duration_s']:.1f}s")
+
+    # ---- Reset (same process, same waves, boat back at spawn) -------------
+    print(f"  Resetting world '{WORLD_NAME}' before PID phase...")
+    reset_world(WORLD_NAME)
+    time.sleep(1.5)
+    wait_for_pose(state, timeout=5.0, want_reset_near_start=True)
+
+    # ---- Phase 2: PID -------------------------------------------------------
+    metrics_pid, records_pid = run_phase(state, pub_left, pub_right, "pid", cfg, run_idx)
+    append_csv_row(csv_path, run_idx, used_seed, wind_speed, wind_angle, steepness,
+                    "pid", **metrics_pid)
+    append_timeseries_rows(ts_csv_path, run_idx, "pid", records_pid)
+    print(f"  pid:    max|cross|={metrics_pid['max_abs_cross_track_m']:.2f} m  "
+          f"arrived={metrics_pid['arrived']}  t={metrics_pid['duration_s']:.1f}s")
+
+    terminate_gz_process(proc)
+    time.sleep(1.0)
+
+
+def run_single_pid_only(run_idx, run_seed, cfg, csv_path, ts_csv_path):
+    """Same as run_single(), but for PID TUNING MODE: only the PID phase is
+    run (no baseline no_pid phase, no mid-run reset needed since the boat
+    starts fresh at spawn for every run anyway). This is faster to iterate
+    on than the full compare mode, since every run is spent exercising the
+    controller you're actually tuning."""
+    print(f"\n=== [PID TUNING] Run {run_idx}/{cfg['num_runs']}  (seed={run_seed}) ===")
+
+    wave_result = randomize_and_write_wave_model(
+        cfg["wind_speed_range"], cfg["wind_angle_range"], cfg["steepness_range"], seed=run_seed
+    )
+    if wave_result:
+        used_seed, wind_speed, wind_angle, steepness = wave_result
+    else:
+        used_seed, wind_speed, wind_angle, steepness = run_seed, float("nan"), float("nan"), float("nan")
+
+    proc = launch_world_background(headless=cfg["headless"])
+    if proc is None:
+        print(f"  Skipping run {run_idx}: could not launch gz sim.")
+        append_csv_row(csv_path, run_idx, used_seed, wind_speed, wind_angle, steepness,
+                        "pid", note="launch_failed")
+        return
+
+    time.sleep(cfg["gz_boot_wait_s"])
+
+    node = NodeCls()
+    pub_left = node.advertise(LEFT_TOPIC, DoubleMsg)
+    pub_right = node.advertise(RIGHT_TOPIC, DoubleMsg)
+    state = PoseState()
+    ok = node.subscribe(PoseVMsg, POSE_TOPIC, state.callback)
+    if not ok:
+        print(f"  WARNING: failed to subscribe to {POSE_TOPIC}")
+
+    if not wait_for_pose(state, timeout=15.0):
+        print(f"  Run {run_idx}: never received pose data on {POSE_TOPIC} - aborting this run.")
+        terminate_gz_process(proc)
+        time.sleep(1.0)
+        append_csv_row(csv_path, run_idx, used_seed, wind_speed, wind_angle, steepness,
+                        "pid", note="no_pose_data")
+        return
+
+    # ---- PID phase only -----------------------------------------------------
+    metrics_pid, records_pid = run_phase(state, pub_left, pub_right, "pid", cfg, run_idx)
+    append_csv_row(csv_path, run_idx, used_seed, wind_speed, wind_angle, steepness,
+                    "pid", **metrics_pid)
+    append_timeseries_rows(ts_csv_path, run_idx, "pid", records_pid)
+    print(f"  pid:    max|cross|={metrics_pid['max_abs_cross_track_m']:.2f} m  "
+          f"arrived={metrics_pid['arrived']}  t={metrics_pid['duration_s']:.1f}s")
+
+    terminate_gz_process(proc)
+    time.sleep(1.0)
+
+
+def run_single_xte_compare(run_idx, run_seed, cfg, csv_path, ts_csv_path):
+    """XTE-ABLATION COMPARE MODE: runs the PID controller twice against the
+    SAME wave field (same reset trick as run_single()) - once with the
+    cross-track feedback terms (Kxte, Kxte_dot, Kxte_ddot) exactly as
+    configured ("pid_xte"), and once with all three of them forced to 0.0,
+    i.e. a heading-only PID ("pid_no_xte"). Kp/Ki/Kd and base thrust are
+    identical in both phases - only the cross-track feedback is switched
+    off, so any difference in behavior between the two phases is
+    attributable to those terms."""
+    print(f"\n=== [XTE COMPARE] Run {run_idx}/{cfg['num_runs']}  (seed={run_seed}) ===")
+
+    wave_result = randomize_and_write_wave_model(
+        cfg["wind_speed_range"], cfg["wind_angle_range"], cfg["steepness_range"], seed=run_seed
+    )
+    if wave_result:
+        used_seed, wind_speed, wind_angle, steepness = wave_result
+    else:
+        used_seed, wind_speed, wind_angle, steepness = run_seed, float("nan"), float("nan"), float("nan")
+
+    proc = launch_world_background(headless=cfg["headless"])
+    if proc is None:
+        print(f"  Skipping run {run_idx}: could not launch gz sim.")
+        append_csv_row(csv_path, run_idx, used_seed, wind_speed, wind_angle, steepness,
+                        "pid_xte", note="launch_failed")
+        append_csv_row(csv_path, run_idx, used_seed, wind_speed, wind_angle, steepness,
+                        "pid_no_xte", note="launch_failed")
+        return
+
+    time.sleep(cfg["gz_boot_wait_s"])
+
+    node = NodeCls()
+    pub_left = node.advertise(LEFT_TOPIC, DoubleMsg)
+    pub_right = node.advertise(RIGHT_TOPIC, DoubleMsg)
+    state = PoseState()
+    ok = node.subscribe(PoseVMsg, POSE_TOPIC, state.callback)
+    if not ok:
+        print(f"  WARNING: failed to subscribe to {POSE_TOPIC}")
+
+    if not wait_for_pose(state, timeout=15.0):
+        print(f"  Run {run_idx}: never received pose data on {POSE_TOPIC} - aborting this run.")
+        terminate_gz_process(proc)
+        time.sleep(1.0)
+        append_csv_row(csv_path, run_idx, used_seed, wind_speed, wind_angle, steepness,
+                        "pid_xte", note="no_pose_data")
+        append_csv_row(csv_path, run_idx, used_seed, wind_speed, wind_angle, steepness,
+                        "pid_no_xte", note="no_pose_data")
+        return
+
+    # ---- Phase 1: PID WITH cross-track terms, exactly as configured -------
+    metrics_xte, records_xte = run_phase(state, pub_left, pub_right, "pid_xte", cfg, run_idx)
+    append_csv_row(csv_path, run_idx, used_seed, wind_speed, wind_angle, steepness,
+                    "pid_xte", **metrics_xte)
+    append_timeseries_rows(ts_csv_path, run_idx, "pid_xte", records_xte)
+    print(f"  pid_xte:    max|cross|={metrics_xte['max_abs_cross_track_m']:.2f} m  "
+          f"arrived={metrics_xte['arrived']}  t={metrics_xte['duration_s']:.1f}s")
+
+    # ---- Reset (same process, same waves, boat back at spawn) -------------
+    print(f"  Resetting world '{WORLD_NAME}' before no-XTE phase...")
+    reset_world(WORLD_NAME)
+    time.sleep(1.5)
+    wait_for_pose(state, timeout=5.0, want_reset_near_start=True)
+
+    # ---- Phase 2: PID with cross-track terms forced OFF --------------------
+    cfg_no_xte = dict(cfg)
+    cfg_no_xte["kxte"] = 0.0
+    cfg_no_xte["kxte_dot"] = 0.0
+    cfg_no_xte["kxte_ddot"] = 0.0
+    metrics_no_xte, records_no_xte = run_phase(state, pub_left, pub_right, "pid_no_xte", cfg_no_xte, run_idx)
+    append_csv_row(csv_path, run_idx, used_seed, wind_speed, wind_angle, steepness,
+                    "pid_no_xte", **metrics_no_xte)
+    append_timeseries_rows(ts_csv_path, run_idx, "pid_no_xte", records_no_xte)
+    print(f"  pid_no_xte: max|cross|={metrics_no_xte['max_abs_cross_track_m']:.2f} m  "
+          f"arrived={metrics_no_xte['arrived']}  t={metrics_no_xte['duration_s']:.1f}s")
+
+    terminate_gz_process(proc)
+    time.sleep(1.0)
+
+
+def run_single_full_real(run_idx, run_seed, cfg, csv_path, ts_csv_path):
+    """FULL REAL MODE: runs all THREE controller configurations against the
+    SAME wave field for this run (same reset-between-phases trick as
+    run_single() / run_single_xte_compare()), so every configuration is
+    compared under identical wind/wave conditions:
+        1. "no_pid"     - constant thrust, no controller at all (baseline).
+        2. "pid_xte"    - the heading PID WITH cross-track feedback terms
+                           (Kxte, Kxte_dot, Kxte_ddot) exactly as configured.
+        3. "pid_no_xte" - the SAME heading PID (same Kp/Ki/Kd/base thrust)
+                           but with all three cross-track feedback terms
+                           forced to 0.0.
+    This is the union of the No-PID-vs-PID comparison and the XTE-ablation
+    comparison, run in a single pass so all three curves are directly
+    comparable against the same randomized wave conditions, instead of
+    being generated from two separate batches (and therefore two separate
+    sets of random wave draws)."""
+    print(f"\n=== [FULL REAL] Run {run_idx}/{cfg['num_runs']}  (seed={run_seed}) ===")
+
+    wave_result = randomize_and_write_wave_model(
+        cfg["wind_speed_range"], cfg["wind_angle_range"], cfg["steepness_range"], seed=run_seed
+    )
+    if wave_result:
+        used_seed, wind_speed, wind_angle, steepness = wave_result
+    else:
+        used_seed, wind_speed, wind_angle, steepness = run_seed, float("nan"), float("nan"), float("nan")
+
+    proc = launch_world_background(headless=cfg["headless"])
+    if proc is None:
+        print(f"  Skipping run {run_idx}: could not launch gz sim.")
+        for m in ("no_pid", "pid_xte", "pid_no_xte"):
+            append_csv_row(csv_path, run_idx, used_seed, wind_speed, wind_angle, steepness,
+                            m, note="launch_failed")
+        return
+
+    time.sleep(cfg["gz_boot_wait_s"])
+
+    node = NodeCls()
+    pub_left = node.advertise(LEFT_TOPIC, DoubleMsg)
+    pub_right = node.advertise(RIGHT_TOPIC, DoubleMsg)
+    state = PoseState()
+    ok = node.subscribe(PoseVMsg, POSE_TOPIC, state.callback)
+    if not ok:
+        print(f"  WARNING: failed to subscribe to {POSE_TOPIC}")
+
+    if not wait_for_pose(state, timeout=15.0):
+        print(f"  Run {run_idx}: never received pose data on {POSE_TOPIC} - aborting this run.")
+        terminate_gz_process(proc)
+        time.sleep(1.0)
+        for m in ("no_pid", "pid_xte", "pid_no_xte"):
+            append_csv_row(csv_path, run_idx, used_seed, wind_speed, wind_angle, steepness,
+                            m, note="no_pose_data")
+        return
+
+    # ---- Phase 1: No PID (constant thrust baseline) -----------------------
+    metrics_no_pid, records_no_pid = run_phase(state, pub_left, pub_right, "no_pid", cfg, run_idx)
+    append_csv_row(csv_path, run_idx, used_seed, wind_speed, wind_angle, steepness,
+                    "no_pid", **metrics_no_pid)
+    append_timeseries_rows(ts_csv_path, run_idx, "no_pid", records_no_pid)
+    print(f"  no_pid:     max|cross|={metrics_no_pid['max_abs_cross_track_m']:.2f} m  "
+          f"final|cross|={metrics_no_pid['final_abs_cross_track_m']:.2f} m  "
+          f"arrived={metrics_no_pid['arrived']}  t={metrics_no_pid['duration_s']:.1f}s")
+
+    # ---- Reset before PID-with-XTE phase -----------------------------------
+    print(f"  Resetting world '{WORLD_NAME}' before pid_xte phase...")
+    reset_world(WORLD_NAME)
+    time.sleep(1.5)
+    wait_for_pose(state, timeout=5.0, want_reset_near_start=True)
+
+    # ---- Phase 2: PID WITH cross-track terms, exactly as configured -------
+    metrics_xte, records_xte = run_phase(state, pub_left, pub_right, "pid_xte", cfg, run_idx)
+    append_csv_row(csv_path, run_idx, used_seed, wind_speed, wind_angle, steepness,
+                    "pid_xte", **metrics_xte)
+    append_timeseries_rows(ts_csv_path, run_idx, "pid_xte", records_xte)
+    print(f"  pid_xte:    max|cross|={metrics_xte['max_abs_cross_track_m']:.2f} m  "
+          f"final|cross|={metrics_xte['final_abs_cross_track_m']:.2f} m  "
+          f"arrived={metrics_xte['arrived']}  t={metrics_xte['duration_s']:.1f}s")
+
+    # ---- Reset before PID-without-XTE phase --------------------------------
+    print(f"  Resetting world '{WORLD_NAME}' before pid_no_xte phase...")
+    reset_world(WORLD_NAME)
+    time.sleep(1.5)
+    wait_for_pose(state, timeout=5.0, want_reset_near_start=True)
+
+    # ---- Phase 3: PID with cross-track terms forced OFF --------------------
+    cfg_no_xte = dict(cfg)
+    cfg_no_xte["kxte"] = 0.0
+    cfg_no_xte["kxte_dot"] = 0.0
+    cfg_no_xte["kxte_ddot"] = 0.0
+    metrics_no_xte, records_no_xte = run_phase(state, pub_left, pub_right, "pid_no_xte", cfg_no_xte, run_idx)
+    append_csv_row(csv_path, run_idx, used_seed, wind_speed, wind_angle, steepness,
+                    "pid_no_xte", **metrics_no_xte)
+    append_timeseries_rows(ts_csv_path, run_idx, "pid_no_xte", records_no_xte)
+    print(f"  pid_no_xte: max|cross|={metrics_no_xte['max_abs_cross_track_m']:.2f} m  "
+          f"final|cross|={metrics_no_xte['final_abs_cross_track_m']:.2f} m  "
+          f"arrived={metrics_no_xte['arrived']}  t={metrics_no_xte['duration_s']:.1f}s")
+
+    terminate_gz_process(proc)
+    time.sleep(1.0)
+
+# Where the last-used config-dialog values are remembered between runs of
+# this script. Lives next to the script itself (not the CWD), so it's found
+# the same way no matter where you launch python3 from.
+CONFIG_SAVE_PATH = Path(__file__).resolve().parent / "batch_test_runner_last_config.json"
+
+# Raw field keys (as used by the `fields` dict in show_config_dialog, plus
+# "mode" and "headless") that get persisted to CONFIG_SAVE_PATH. Kept as a
+# single source of truth so save/load can't drift out of sync with the
+# dialog's own field list.
+_PERSISTED_KEYS = [
+    "mode", "runs", "seed", "timeout", "boot", "base", "kp", "ki", "kd", "kxte",
+    "kxte_dot", "kxte_ddot", "drift_tau",
+    "ws_min", "ws_max", "wa_min", "wa_max", "st_min", "st_max", "rtf",
+    "csv", "ts_csv", "plot", "headless",
+]
+
+
+def load_last_config():
+    """Returns a dict of last-saved raw field values (all strings, plus a
+    bool for "headless"), or {} if there's no saved config yet / it's
+    unreadable. Never raises - a corrupt/missing file just means the
+    dialog falls back to its hardcoded defaults."""
+    if not CONFIG_SAVE_PATH.exists():
+        return {}
+    try:
+        import json
+        with open(CONFIG_SAVE_PATH, "r") as f:
+            data = json.load(f)
+        return {k: v for k, v in data.items() if k in _PERSISTED_KEYS}
+    except Exception as e:
+        print(f"Could not read saved config at {CONFIG_SAVE_PATH} ({e}) - using defaults.")
+        return {}
+
+
+def save_last_config(values):
+    """`values` is a dict with the same keys as _PERSISTED_KEYS (raw
+    strings from the Entry widgets, plus "mode" and "headless"). Best
+    effort - a failure to save should never block starting the batch."""
+    try:
+        import json
+        CONFIG_SAVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_SAVE_PATH, "w") as f:
+            json.dump(values, f, indent=2)
+        print(f"Saved config settings to {CONFIG_SAVE_PATH}")
+    except Exception as e:
+        print(f"WARNING: could not save config settings to {CONFIG_SAVE_PATH}: {e}")
+
+
+def show_config_dialog():
+    result = {}
+    started = {"ok": False}
+    saved = load_last_config()
+
+    def sv(key, hardcoded_default):
+        """Saved value for `key` if we have one, else the hardcoded default."""
+        return saved[key] if key in saved else hardcoded_default
+
+    root = tk.Tk()
+    root.title("Autonomous Boat Test — Batch Config")
+
+    fields = {}
+
+    def add_row(r, label, key, default):
+        ttk.Label(root, text=label).grid(row=r, column=0, sticky="w", padx=8, pady=3)
+        v = tk.StringVar(value=str(sv(key, default)))
+        ttk.Entry(root, textvariable=v, width=18).grid(row=r, column=1, padx=8, pady=3)
+        return v
+
+    # ---- Mode selector: full No-PID vs PID comparison, or PID-only tuning --
+    ttk.Label(root, text="Mode").grid(row=0, column=0, sticky="w", padx=8, pady=3)
+    mode_var = tk.StringVar(value=sv("mode", "compare"))
+    mode_frame = ttk.Frame(root)
+    mode_frame.grid(row=0, column=1, sticky="w", padx=8, pady=3)
+    ttk.Radiobutton(mode_frame, text="Compare (No PID vs PID)", variable=mode_var,
+                     value="compare").pack(anchor="w")
+    ttk.Radiobutton(mode_frame, text="PID tuning (PID only + error plots)", variable=mode_var,
+                     value="pid_tuning").pack(anchor="w")
+    ttk.Radiobutton(mode_frame, text="XTE compare (PID with vs without cross-track terms)",
+                     variable=mode_var, value="xte_compare").pack(anchor="w")
+    ttk.Radiobutton(mode_frame, text="Full real (No PID vs PID w/XTE vs PID no XTE)",
+                     variable=mode_var, value="full_real").pack(anchor="w")
+
+    fields["runs"] = add_row(1, "Number of test runs", "runs", 5)
+    fields["seed"] = add_row(2, "Batch seed (blank = fully random each run)", "seed", "")
+    fields["timeout"] = add_row(3, "Per-phase timeout (s)", "timeout", 90)
+    fields["boot"] = add_row(4, "gz sim boot wait (s)", "boot", 3.0)
+    fields["base"] = add_row(5, "Base thrust (N)", "base", BASE_THRUST_DEFAULT)
+    fields["kp"] = add_row(6, "PID Kp", "kp", KP_DEFAULT)
+    fields["ki"] = add_row(7, "PID Ki", "ki", KI_DEFAULT)
+    fields["kd"] = add_row(8, "PID Kd", "kd", KD_DEFAULT)
+    fields["kxte"] = add_row(9, "PID Kxte (cross-track position)", "kxte", KXTE_DEFAULT)
+    fields["kxte_dot"] = add_row(10, "PID Kxte_dot (cross-track drift rate)", "kxte_dot", KXTE_DOT_DEFAULT)
+    fields["kxte_ddot"] = add_row(11, "PID Kxte_ddot (cross-track drift accel, optional)", "kxte_ddot", KXTE_DDOT_DEFAULT)
+    fields["drift_tau"] = add_row(12, "Drift filter time constant (s)", "drift_tau", DRIFT_FILTER_TAU_DEFAULT)
+    fields["ws_min"] = add_row(13, "Wind speed min (m/s)", "ws_min", WIND_SPEED_RANGE_DEFAULT[0])
+    fields["ws_max"] = add_row(14, "Wind speed max (m/s)", "ws_max", WIND_SPEED_RANGE_DEFAULT[1])
+    fields["wa_min"] = add_row(15, "Wind angle min (deg)", "wa_min", WIND_ANGLE_RANGE_DEFAULT[0])
+    fields["wa_max"] = add_row(16, "Wind angle max (deg)", "wa_max", WIND_ANGLE_RANGE_DEFAULT[1])
+    fields["st_min"] = add_row(17, "Steepness min", "st_min", STEEPNESS_RANGE_DEFAULT[0])
+    fields["st_max"] = add_row(18, "Steepness max", "st_max", STEEPNESS_RANGE_DEFAULT[1])
+    fields["rtf"] = add_row(19, "Real-time factor override (1.0 = no change)", "rtf", 1.0)
+    fields["csv"] = add_row(20, "Output summary CSV path", "csv", "batch_results.csv")
+    fields["ts_csv"] = add_row(21, "Output time-series CSV path", "ts_csv", "batch_timeseries.csv")
+    fields["plot"] = add_row(22, "Output plot path (base name)", "plot", "batch_divergence_plot.png")
+
+    headless_var = tk.BooleanVar(value=bool(sv("headless", True)))
+    ttk.Checkbutton(root, text="Run gz sim headless (server only — much faster)",
+                    variable=headless_var).grid(row=23, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 0))
+
+    note = ""
+    ttk.Label(root, text=note, foreground="#555", wraplength=380, justify="left").grid(
+        row=24, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 0)
+    )
+
+    def on_start():
         try:
-            p = {name: float(self.entries[name].get()) for name, _ in PARAM_FIELDS}
+            result["mode"] = mode_var.get()
+            result["num_runs"] = int(fields["runs"].get())
+            if result["num_runs"] < 1:
+                raise ValueError
+            seed_str = fields["seed"].get().strip()
+            result["seed"] = int(seed_str) if seed_str else None
+            result["timeout_s"] = float(fields["timeout"].get())
+            result["gz_boot_wait_s"] = float(fields["boot"].get())
+            result["base_thrust"] = float(fields["base"].get())
+            result["kp"] = float(fields["kp"].get())
+            result["ki"] = float(fields["ki"].get())
+            result["kd"] = float(fields["kd"].get())
+            result["kxte"] = float(fields["kxte"].get())
+            result["kxte_dot"] = float(fields["kxte_dot"].get())
+            result["kxte_ddot"] = float(fields["kxte_ddot"].get())
+            result["drift_tau"] = float(fields["drift_tau"].get())
+            result["wind_speed_range"] = (float(fields["ws_min"].get()), float(fields["ws_max"].get()))
+            result["wind_angle_range"] = (float(fields["wa_min"].get()), float(fields["wa_max"].get()))
+            result["steepness_range"] = (float(fields["st_min"].get()), float(fields["st_max"].get()))
+            result["real_time_factor"] = float(fields["rtf"].get())
+            result["output_csv"] = fields["csv"].get().strip() or "batch_results.csv"
+            result["output_timeseries_csv"] = fields["ts_csv"].get().strip() or "batch_timeseries.csv"
+            result["output_plot"] = fields["plot"].get().strip() or "batch_divergence_plot.png"
+            result["headless"] = bool(headless_var.get())
         except ValueError:
-            messagebox.showerror("Bad value", "All fields must be numbers.")
+            messagebox.showerror("Bad input", "Please check the values (numbers only; runs >= 1).")
             return
-        result = respawn(p)
-        self.status.delete("1.0", tk.END)
-        self.status.insert(tk.END, result)
+
+        # Persist the raw form values (not the parsed `result`) so the
+        # dialog can be pre-filled exactly as typed next time, including a
+        # blank seed field.
+        to_save = {key: v.get() for key, v in fields.items()}
+        to_save["mode"] = mode_var.get()
+        to_save["headless"] = bool(headless_var.get())
+        save_last_config(to_save)
+
+        started["ok"] = True
+        root.destroy()
+
+    def on_cancel():
+        root.destroy()
+
+    btn_frame = ttk.Frame(root)
+    btn_frame.grid(row=25, column=0, columnspan=2, pady=10)
+    ttk.Button(btn_frame, text="Start batch", command=on_start).pack(side="left", padx=6)
+    ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side="left", padx=6)
+
+    root.mainloop()
+    return result if started["ok"] else None
 
 
-def parse_args():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--no-auto-launch", action="store_true",
-                     help="Don't randomize waves / launch gz sim - assume it's already running")
-    ap.add_argument("--seed", type=int, default=None,
-                     help="Fix the wave-randomization RNG seed (default: random each run)")
-    ap.add_argument("--wind-speed", type=float, nargs=2, metavar=("MIN", "MAX"), default=WIND_SPEED_RANGE)
-    ap.add_argument("--wind-angle", type=float, nargs=2, metavar=("MIN", "MAX"), default=WIND_ANGLE_RANGE)
-    ap.add_argument("--steepness", type=float, nargs=2, metavar=("MIN", "MAX"), default=STEEPNESS_RANGE)
-    return ap.parse_args()
+# ============================================================================
+# Plotting
+# ============================================================================
+
+
+def _plot_path_with_suffix(out_path, suffix):
+    """batch_divergence_plot.png + '_heading_time' -> batch_divergence_plot_heading_time.png"""
+    p = Path(out_path)
+    return str(p.with_name(p.stem + suffix + p.suffix))
+
+
+def _load_summary(csv_path, modes=("no_pid", "pid"), value_col="max_abs_cross_track_m"):
+    """Returns {mode: (runs, values)} for each mode in `modes`, where `runs`
+    and `values` are parallel lists of run number / |value_col| (aborted
+    runs with no data, or runs missing that column, are skipped). Defaults
+    to the max |cross-track error| column; pass value_col=
+    "final_abs_cross_track_m" to get the FINAL |cross-track error| instead."""
+    result = {m: ([], []) for m in modes}
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if not row.get(value_col):
+                continue  # skip aborted runs / runs with no data for this column
+            mode = row["mode"]
+            if mode not in result:
+                continue
+            run = int(row["run"])
+            val = abs(float(row[value_col]))
+            result[mode][0].append(run)
+            result[mode][1].append(val)
+    return result
+
+
+def _load_timeseries(ts_csv_path, modes=("no_pid", "pid")):
+    """Returns {mode: {run: {'t': [...], 'cross': [...], 'yaw': [...], 'along': [...]}}}
+    for each mode in `modes`."""
+    data = {m: {} for m in modes}
+    if not os.path.exists(ts_csv_path):
+        return data
+    with open(ts_csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            mode = row["mode"]
+            if mode not in data:
+                continue
+            run = int(row["run"])
+            bucket = data[mode].setdefault(run, {"t": [], "cross": [], "yaw": [], "along": []})
+            bucket["t"].append(float(row["t_s"]))
+            bucket["cross"].append(abs(float(row["cross_track_m"])))
+            bucket["yaw"].append(float(row["yaw_deg"]))
+            bucket["along"].append(float(row["along_track_m"]))
+    return data
+
+
+def _load_timeseries_pid_tuning(ts_csv_path):
+    """Like _load_timeseries(), but keeps the SIGNED cross-track error and
+    heading error (not abs), plus thrust commands and the filtered
+    cross-track drift velocity/acceleration, for PID-tuning diagnostic
+    plots. Returns {run: {'t':[...], 'heading_error':[...],
+    'cross_track':[...], 'cross_track_vel':[...], 'cross_track_accel':[...],
+    'left_thrust':[...], 'right_thrust':[...]}}."""
+    data = {}
+    if not os.path.exists(ts_csv_path):
+        return data
+    with open(ts_csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row["mode"] != "pid":
+                continue
+            run = int(row["run"])
+            bucket = data.setdefault(run, {
+                "t": [], "heading_error": [], "cross_track": [],
+                "cross_track_vel": [], "cross_track_accel": [],
+                "left_thrust": [], "right_thrust": [],
+            })
+            bucket["t"].append(float(row["t_s"]))
+            bucket["heading_error"].append(float(row["heading_error_deg"]))
+            bucket["cross_track"].append(float(row["cross_track_m"]))
+            bucket["cross_track_vel"].append(float(row.get("cross_track_vel_mps", 0.0) or 0.0))
+            bucket["cross_track_accel"].append(float(row.get("cross_track_accel_mps2", 0.0) or 0.0))
+            bucket["left_thrust"].append(float(row["left_thrust_N"]))
+            bucket["right_thrust"].append(float(row["right_thrust_N"]))
+    return data
+
+
+def _mean_std_over_time(per_run_dict, key, grid):
+    """per_run_dict: {run: {'t': [...], key: [...]}}. Interpolates every
+    run's series onto `grid`, leaving NaN past that run's own end time
+    (no extrapolation), then returns (mean, std) ignoring NaNs at each grid
+    point. Returns (None, None) if there's no data at all."""
+    import numpy as np
+
+    if not per_run_dict:
+        return None, None
+    stacked = []
+    for run, series in per_run_dict.items():
+        t = np.asarray(series["t"])
+        v = np.asarray(series[key])
+        if len(t) < 2:
+            continue
+        interp = np.interp(grid, t, v, left=np.nan, right=np.nan)
+        stacked.append(interp)
+    if not stacked:
+        return None, None
+    stacked = np.vstack(stacked)
+    with np.errstate(all="ignore"):
+        mean = np.nanmean(stacked, axis=0)
+        std = np.nanstd(stacked, axis=0)
+    return mean, std
+
+
+def _plot_mean_std_over_time(ts_data, key, ylabel, title, out_path,
+                              modes=("no_pid", "pid"),
+                              colors=None, labels=None):
+    """One figure comparing the given modes: mean line + shaded +/-1 std
+    band over time, built from all runs' time-series for `key`. `ts_data`
+    must have an entry for every mode in `modes` (as returned by
+    _load_timeseries(..., modes=modes))."""
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if colors is None:
+        colors = {"no_pid": "crimson", "pid": "royalblue"}
+    if labels is None:
+        labels = {"no_pid": "No PID", "pid": "PID"}
+
+    max_t = 0.0
+    for mode in modes:
+        for series in ts_data[mode].values():
+            if series["t"]:
+                max_t = max(max_t, series["t"][-1])
+    if max_t <= 0:
+        return False
+
+    grid = np.linspace(0.0, max_t, 200)
+
+    plt.figure(figsize=(9, 6))
+    plotted_any = False
+    for mode in modes:
+        mean, std = _mean_std_over_time(ts_data[mode], key, grid)
+        if mean is None:
+            continue
+        plotted_any = True
+        color = colors[mode]
+        plt.plot(grid, mean, color=color, label=labels[mode], linewidth=2)
+        plt.fill_between(grid, mean - std, mean + std, color=color, alpha=0.2)
+
+    if not plotted_any:
+        plt.close()
+        return False
+
+    plt.xlabel("Time (s)")
+    plt.ylabel(ylabel)
+    plt.title(title, fontsize=11)
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"Saved plot to {out_path}")
+    return True
+
+
+def _plot_divergence_scatter(csv_path, out_path, title, value_col, ylabel,
+                              modes, colors, labels, markers=None):
+    """Shared scatter-plot helper for a per-run divergence metric (max or
+    final |cross-track error|) across an arbitrary set of modes. Used by
+    both the 2-mode (No PID vs PID / XTE compare) and 3-mode (full real)
+    plotting functions so the max-divergence and final-divergence scatters
+    stay visually consistent with each other."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
+
+    if markers is None:
+        default_markers = ["o", "^", "s", "D", "v", "P"]
+        markers = {m: default_markers[i % len(default_markers)] for i, m in enumerate(modes)}
+
+    summary = _load_summary(csv_path, modes=modes, value_col=value_col)
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    plotted_any = False
+    for mode in modes:
+        runs, vals = summary[mode]
+        if not runs:
+            continue
+        plotted_any = True
+        ax.scatter(runs, vals, color=colors[mode], label=labels[mode],
+                   marker=markers[mode], s=60)
+    ax.set_xlabel("Run number")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, fontsize=11)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    if plotted_any:
+        ax.legend()
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved plot to {out_path}")
+    return plotted_any
+
+
+def make_plot(csv_path, ts_csv_path, out_path):
+    modes = ("no_pid", "pid")
+    colors = {"no_pid": "crimson", "pid": "royalblue"}
+    labels = {"no_pid": "No PID", "pid": "PID"}
+    markers = {"no_pid": "o", "pid": "^"}
+
+    # ---- Plot 1: scatter of max |cross-track divergence| per run ----------
+    _plot_divergence_scatter(
+        csv_path, out_path,
+        "Path divergence: No PID vs PID (across randomized wave conditions)",
+        "max_abs_cross_track_m", "Max |cross-track divergence| (m)",
+        modes, colors, labels, markers,
+    )
+
+    # ---- Plots 2-4: mean +/- std time-series comparisons -------------------
+    ts_data = _load_timeseries(ts_csv_path, modes=modes)
+
+    _plot_mean_std_over_time(
+        ts_data, "cross", "|Cross-track error| (m)",
+        "Mean |cross-track error| over time (shaded = ±1 std across runs)",
+        _plot_path_with_suffix(out_path, "_cross_track_error_time"),
+        modes=modes,
+    )
+    _plot_mean_std_over_time(
+        ts_data, "yaw", "Heading / yaw (deg)",
+        "Mean heading over time (shaded = ±1 std across runs)",
+        _plot_path_with_suffix(out_path, "_heading_time"),
+        modes=modes,
+    )
+    _plot_mean_std_over_time(
+        ts_data, "along", "Along-track progress (m)",
+        "Mean along-track progress over time (shaded = ±1 std across runs)",
+        _plot_path_with_suffix(out_path, "_progress_time"),
+        modes=modes,
+    )
+
+
+def make_xte_compare_plot(csv_path, ts_csv_path, out_path, cfg):
+    """XTE-ABLATION COMPARE MODE plots: same structure as make_plot(), but
+    comparing "pid_xte" (PID with cross-track terms as configured) against
+    "pid_no_xte" (identical Kp/Ki/Kd, cross-track terms forced to 0) instead
+    of No-PID vs PID. Produces the same 4 figures: a scatter of max
+    |cross-track divergence| per run, plus mean +/- std over time for
+    |cross-track error|, heading, and along-track progress."""
+    modes = ("pid_no_xte", "pid_xte")
+    colors = {"pid_no_xte": "darkorange", "pid_xte": "royalblue"}
+    labels = {"pid_no_xte": "PID, no XTE terms", "pid_xte": "PID, with XTE terms"}
+    markers = {"pid_no_xte": "o", "pid_xte": "^"}
+
+    gains_str = (f"Kxte={cfg['kxte']:g}  Kxte_dot={cfg.get('kxte_dot', 0.0):g}  "
+                 f"Kxte_ddot={cfg.get('kxte_ddot', 0.0):g}")
+
+    # ---- Plot 1: scatter of max |cross-track divergence| per run ----------
+    _plot_divergence_scatter(
+        csv_path, out_path,
+        f"Path divergence: PID with vs without cross-track terms\n({gains_str})",
+        "max_abs_cross_track_m", "Max |cross-track divergence| (m)",
+        modes, colors, labels, markers,
+    )
+
+    # ---- Plots 2-4: mean +/- std time-series comparisons -------------------
+    ts_data = _load_timeseries(ts_csv_path, modes=modes)
+
+    _plot_mean_std_over_time(
+        ts_data, "cross", "|Cross-track error| (m)",
+        f"Mean |cross-track error| over time — with vs without XTE terms\n({gains_str})",
+        _plot_path_with_suffix(out_path, "_cross_track_error_time"),
+        modes=modes, colors=colors, labels=labels,
+    )
+    _plot_mean_std_over_time(
+        ts_data, "yaw", "Heading / yaw (deg)",
+        f"Mean heading over time — with vs without XTE terms\n({gains_str})",
+        _plot_path_with_suffix(out_path, "_heading_time"),
+        modes=modes, colors=colors, labels=labels,
+    )
+    _plot_mean_std_over_time(
+        ts_data, "along", "Along-track progress (m)",
+        f"Mean along-track progress over time — with vs without XTE terms\n({gains_str})",
+        _plot_path_with_suffix(out_path, "_progress_time"),
+        modes=modes, colors=colors, labels=labels,
+    )
+
+
+def make_full_real_plot(csv_path, ts_csv_path, out_path, cfg):
+    """FULL REAL MODE plots: three-way comparison of "no_pid", "pid_no_xte"
+    and "pid_xte", all drawn from the SAME batch of runs / wave conditions.
+    Produces everything make_plot()/make_xte_compare_plot() produce (a
+    scatter of MAX |cross-track divergence| per run, plus mean +/- std over
+    time for |cross-track error|, heading, and along-track progress) PLUS
+    two additional figures:
+      - a scatter of the FINAL |cross-track divergence| per run (i.e. how
+        far off the line the boat ended up at the end of the run, as
+        opposed to the worst moment during it).
+      - a PID-only (pid_no_xte vs pid_xte) mean +/- std |cross-track error|
+        plot, EXCLUDING "no_pid". The 3-way cross-track plot above is
+        dominated by how much larger no_pid's divergence is, which flattens
+        the with-XTE vs without-XTE difference down to barely-visible scale
+        (see the 3-way plot vs the xte_compare-mode plot for the same
+        gains). This extra figure re-plots just the two PID variants
+        against each other so that difference is actually readable."""
+    modes = ("no_pid", "pid_no_xte", "pid_xte")
+    colors = {"no_pid": "crimson", "pid_no_xte": "darkorange", "pid_xte": "royalblue"}
+    labels = {"no_pid": "No PID", "pid_no_xte": "PID, no XTE terms", "pid_xte": "PID, with XTE terms"}
+    markers = {"no_pid": "o", "pid_no_xte": "s", "pid_xte": "^"}
+
+    gains_str = (f"Kp={cfg['kp']:g}  Ki={cfg['ki']:g}  Kd={cfg['kd']:g}  "
+                 f"Kxte={cfg['kxte']:g}  Kxte_dot={cfg.get('kxte_dot', 0.0):g}  "
+                 f"Kxte_ddot={cfg.get('kxte_ddot', 0.0):g}")
+
+    # ---- Plot 1: scatter of MAX |cross-track divergence| per run ----------
+    _plot_divergence_scatter(
+        csv_path, out_path,
+        f"Path divergence (max): No PID vs PID (no XTE) vs PID (XTE)\n[{gains_str}]",
+        "max_abs_cross_track_m", "Max |cross-track divergence| (m)",
+        modes, colors, labels, markers,
+    )
+
+    # ---- Additional plot: scatter of FINAL |cross-track divergence| -------
+    # Distinct from the "max" scatter above: this is where the boat ended
+    # up when the phase finished (arrival or timeout), not the worst
+    # moment of divergence seen at any point along the way.
+    _plot_divergence_scatter(
+        csv_path, _plot_path_with_suffix(out_path, "_final_divergence"),
+        f"Path divergence (final): No PID vs PID (no XTE) vs PID (XTE)\n[{gains_str}]",
+        "final_abs_cross_track_m", "Final |cross-track divergence| (m)",
+        modes, colors, labels, markers,
+    )
+
+    # ---- Plots 3-5: mean +/- std time-series comparisons (3-way) -----------
+    ts_data = _load_timeseries(ts_csv_path, modes=modes)
+
+    _plot_mean_std_over_time(
+        ts_data, "cross", "|Cross-track error| (m)",
+        f"Mean |cross-track error| over time — No PID vs PID (no XTE) vs PID (XTE)\n[{gains_str}]",
+        _plot_path_with_suffix(out_path, "_cross_track_error_time"),
+        modes=modes, colors=colors, labels=labels,
+    )
+    _plot_mean_std_over_time(
+        ts_data, "yaw", "Heading / yaw (deg)",
+        f"Mean heading over time — No PID vs PID (no XTE) vs PID (XTE)\n[{gains_str}]",
+        _plot_path_with_suffix(out_path, "_heading_time"),
+        modes=modes, colors=colors, labels=labels,
+    )
+    _plot_mean_std_over_time(
+        ts_data, "along", "Along-track progress (m)",
+        f"Mean along-track progress over time — No PID vs PID (no XTE) vs PID (XTE)\n[{gains_str}]",
+        _plot_path_with_suffix(out_path, "_progress_time"),
+        modes=modes, colors=colors, labels=labels,
+    )
+
+    # ---- Extra plot: PID-only comparison (with vs without XTE terms) -------
+    # Same mean +/- std cross-track curve as above, but excluding "no_pid"
+    # so the y-axis isn't dominated by its much larger divergence - this is
+    # what actually shows the XTE-term effect at a readable scale (matches
+    # the equivalent plot from xte_compare mode, but drawn from this same
+    # full_real batch/wave conditions instead of a separate batch).
+    xte_only_modes = ("pid_no_xte", "pid_xte")
+    _plot_mean_std_over_time(
+        ts_data, "cross", "|Cross-track error| (m)",
+        f"Mean |cross-track error| over time — PID (no XTE) vs PID (XTE) only\n[{gains_str}]",
+        _plot_path_with_suffix(out_path, "_xte_only_cross_track_error_time"),
+        modes=xte_only_modes, colors=colors, labels=labels,
+    )
+
+
+def make_pid_tuning_plot(ts_csv_path, out_path, cfg):
+    """PID-TUNING diagnostic plot: a single figure with stacked subplots,
+    one run per color, showing (top to bottom):
+        1. Heading error (deg) vs time  - the signal the PID is driving to
+           zero. Watch for: steady-state offset (raise Ki), slow decay
+           (raise Kp), overshoot/ringing (lower Kp or raise Kd), high-freq
+           chatter (lower Kd or add filtering).
+        2. Cross-track error (m) vs time - the resulting path-following
+           error (also fed back via Kxte if you're using it).
+        3. Cross-track drift velocity/acceleration vs time - the filtered
+           sideways-drift signals fed back via Kxte_dot/Kxte_ddot. This is
+           the one to watch for beam-wave pushes: a wave hitting the boat
+           from the side shows up here as a velocity (and, more sharply, an
+           acceleration) spike well before it turns into a large heading or
+           cross-track-position error - if the boat isn't correcting for
+           those pushes fast enough, raise Kxte_dot (and only reach for
+           Kxte_ddot if that alone isn't reacting quickly enough).
+        4. Left/right thruster commands (N) vs time - useful for spotting
+           saturation (commands pinned at 0 or MAX_THRUST) and oscillation
+           in the actuator output itself, which usually shows up here
+           before it's obvious in the error traces.
+    A dashed zero-line is drawn on the error/drift subplots as a reference.
+    Individual runs are plotted (not just mean/std) since with only a
+    handful of tuning runs you want to see each one's actual behavior,
+    not a smoothed average of them - but if there are many runs, only
+    the first few are labeled in the legend to avoid clutter.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ts_data = _load_timeseries_pid_tuning(ts_csv_path)
+    if not ts_data:
+        print("No PID time-series data found - skipping PID tuning plot.")
+        return False
+
+    fig, (ax_head, ax_cross, ax_drift, ax_thrust) = plt.subplots(
+        4, 1, figsize=(10, 14), sharex=True
+    )
+
+    cmap = plt.get_cmap("tab10")
+    max_labeled = 10  # avoid an unreadable legend if there are many runs
+
+    for i, (run_idx, series) in enumerate(sorted(ts_data.items())):
+        color = cmap(i % 10)
+        label = f"run {run_idx}" if i < max_labeled else None
+
+        ax_head.plot(series["t"], series["heading_error"], color=color, linewidth=1.4, label=label)
+        ax_cross.plot(series["t"], series["cross_track"], color=color, linewidth=1.4, label=label)
+        ax_drift.plot(series["t"], series["cross_track_vel"], color=color, linewidth=1.3,
+                       linestyle="-", label=(f"{label} vel" if label else None))
+        ax_drift.plot(series["t"], series["cross_track_accel"], color=color, linewidth=1.0,
+                       linestyle="--", alpha=0.7, label=(f"{label} accel" if label else None))
+        ax_thrust.plot(series["t"], series["left_thrust"], color=color, linewidth=1.2,
+                        linestyle="-", label=(f"{label} L" if label else None))
+        ax_thrust.plot(series["t"], series["right_thrust"], color=color, linewidth=1.2,
+                        linestyle="--", label=(f"{label} R" if label else None))
+
+    ax_head.axhline(0.0, color="black", linewidth=0.8, linestyle=":")
+    ax_head.set_ylabel("Heading error (deg)")
+    ax_head.set_title(
+        "PID tuning diagnostics\n"
+        f"Kp={cfg['kp']:g}  Ki={cfg['ki']:g}  Kd={cfg['kd']:g}  "
+        f"Kxte={cfg['kxte']:g}  Kxte_dot={cfg.get('kxte_dot', 0.0):g}  "
+        f"Kxte_ddot={cfg.get('kxte_ddot', 0.0):g}  (base thrust={cfg['base_thrust']:g} N)",
+        fontsize=11,
+    )
+    ax_head.grid(alpha=0.3)
+    ax_head.legend(fontsize=8, ncol=2, loc="upper right")
+
+    ax_cross.axhline(0.0, color="black", linewidth=0.8, linestyle=":")
+    ax_cross.set_ylabel("Cross-track error (m)")
+    ax_cross.grid(alpha=0.3)
+
+    ax_drift.axhline(0.0, color="black", linewidth=0.8, linestyle=":")
+    ax_drift.set_ylabel("Cross-track drift\n(solid=vel m/s, dashed=accel m/s²)")
+    ax_drift.grid(alpha=0.3)
+    ax_drift.legend(fontsize=7, ncol=2, loc="upper right")
+
+    ax_thrust.axhline(cfg["base_thrust"], color="black", linewidth=0.8, linestyle=":")
+    ax_thrust.set_ylabel("Thrust (N)\n(solid=left, dashed=right)")
+    ax_thrust.set_xlabel("Time (s)")
+    ax_thrust.grid(alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved PID tuning diagnostics plot to {out_path}")
+    return True
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+
+def main():
+    if NodeCls is None:
+        print(
+            "gz-transport Python bindings not found. Install e.g.:\n"
+            "  sudo apt install python3-gz-transport14\n"
+            "(or python3-gz-transport12 / 13 / 15, matching your gz version)\n"
+            "This batch runner needs live pose feedback and cannot run without them."
+        )
+        return
+
+    cfg = show_config_dialog()
+    if cfg is None:
+        print("Cancelled.")
+        return
+
+    print("Batch config:")
+    for k, v in cfg.items():
+        print(f"  {k}: {v}")
+
+    # Reset output files at the START of each batch so a previous batch's
+    # leftover rows never get appended to / mixed into this batch's plots
+    # (this was the cause of duplicate run numbers and broken graphs).
+    for path_key in ("output_csv", "output_timeseries_csv"):
+        p = Path(cfg[path_key])
+        if p.exists():
+            print(f"Removing previous output file: {p}")
+            p.unlink()
+
+    seed_master = random.Random(cfg["seed"]) if cfg["seed"] is not None else random.SystemRandom()
+
+    run_fn_by_mode = {
+        "pid_tuning": run_single_pid_only,
+        "xte_compare": run_single_xte_compare,
+        "full_real": run_single_full_real,
+        "compare": run_single,
+    }
+    mode = cfg.get("mode", "compare")
+    run_fn = run_fn_by_mode.get(mode, run_single)
+
+    rtf_backup = patch_real_time_factor(cfg["real_time_factor"])
+    try:
+        for run_idx in range(1, cfg["num_runs"] + 1):
+            run_seed = seed_master.randrange(2 ** 31)
+            try:
+                run_fn(run_idx, run_seed, cfg, cfg["output_csv"], cfg["output_timeseries_csv"])
+            except Exception as e:
+                print(f"  ERROR during run {run_idx}: {e}")
+                terminate_gz_process(_active_gz_proc)
+    finally:
+        restore_real_time_factor(rtf_backup)
+
+    print(f"\nAll runs complete. Summary results in {cfg['output_csv']}")
+    print(f"Time-series results in {cfg['output_timeseries_csv']}")
+    try:
+        if mode == "pid_tuning":
+            make_pid_tuning_plot(
+                cfg["output_timeseries_csv"],
+                _plot_path_with_suffix(cfg["output_plot"], "_pid_tuning"),
+                cfg,
+            )
+        elif mode == "xte_compare":
+            make_xte_compare_plot(
+                cfg["output_csv"], cfg["output_timeseries_csv"],
+                _plot_path_with_suffix(cfg["output_plot"], "_xte_compare"),
+                cfg,
+            )
+        elif mode == "full_real":
+            make_full_real_plot(
+                cfg["output_csv"], cfg["output_timeseries_csv"],
+                _plot_path_with_suffix(cfg["output_plot"], "_full_real"),
+                cfg,
+            )
+        else:
+            make_plot(cfg["output_csv"], cfg["output_timeseries_csv"], cfg["output_plot"])
+    except ImportError:
+        print("matplotlib/numpy not installed - install with:\n  pip install matplotlib numpy --break-system-packages")
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    gz_process = None
-    wave_info = None
-
-    if AUTO_LAUNCH_WORLD and not args.no_auto_launch:
-        result = randomize_and_write_wave_model(
-            tuple(args.wind_speed), tuple(args.wind_angle), tuple(args.steepness), seed=args.seed
-        )
-        gz_process = launch_world_background()
-        if gz_process is not None:
-            time.sleep(GZ_BOOT_WAIT_S)  # give gz sim a moment to come up before connecting
-        if result:
-            used_seed, wind_speed, wind_angle, steepness = result
-            wave_info = (f"Waves this run: seed={used_seed}  wind_speed={wind_speed:.2f} m/s  "
-                         f"wind_angle={wind_angle:.1f} deg  steepness={steepness:.2f}")
-        else:
-            wave_info = "Wave randomization skipped (see console) - using existing wave model."
-    else:
-        wave_info = "Auto-launch disabled (--no-auto-launch) - assuming gz sim & waves are already set up."
-
-    App(gz_process=gz_process, wave_info=wave_info).mainloop()
+    main()

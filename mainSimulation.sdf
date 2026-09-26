@@ -60,7 +60,7 @@
       <background>0.8 0.8 0.8</background>
     </scene>
 
-    <light type="directional" name="world_sun">
+    <light type="directional" name="sun">
       <cast_shadows>false</cast_shadows>
       <pose>0 0 10 0 0 0</pose>
       <diffuse>1 1 1 1</diffuse>
@@ -77,7 +77,7 @@
     </include>
 
     <!-- ================= OCEAN CURRENT =================
-         No plugin needed here: the Hydrodynamics system attached to "body" below
+         No plugin needed here: the Hydrodynamics system attached to "hull" below
          already listens on /ocean_current:
            gz topic -t /ocean_current -m gz.msgs.Vector3d -p 'x: 1.0, y: 0.3, z: 0' -->
 
@@ -109,26 +109,254 @@
       </link>
     </model>
 
-    <!-- ================= ACTUAL ROBOT =================
-         rescue-float-robot, loaded from the URDF exported by onshape-to-robot.
-         Wrapped in a <model> with merge="true" on the <include> (SDFormat 1.9
-         "merge-include"), so the URDF's links/joints get folded into this
-         model, letting us attach plugins alongside it — <plugin> can't be a
-         direct child of <include> itself.
-         Link/joint names come from the URDF: hull link is "body",
-         thruster joints are "leftmotor" / "rightmotor". -->
-    <model name="rescue_float_robot">
-      <pose>0 0 0.1 0 0.031 -1.5708</pose>
+    <!-- ================= BOAT =================
+         Physics/collision are UNCHANGED from the known-stable primitive
+         build: same "hull" link, same four collision_* primitives, same
+         mass/inertia, same prop links/joints, same Hydrodynamics/Thruster
+         plugin config. Only the VISUAL geometry changed - the primitive
+         placeholder visuals (visual_nose/visual_body/visual_leg_*, the
+         center-block/handle/slot approximations) are replaced with the
+         real onshape-to-robot CAD meshes from
+         models/realRobot/rescue-float-robot/assets/*.stl.
 
-      <include merge="true">
-        <uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/robot/rescue-float-robot/robot.urdf</uri>
-      </include>
+         FRAME NOTE: those CAD meshes were originally authored for the
+         URDF's "body" link, whose local +Y is forward (the old
+         water_test.sdf/dry_test.sdf spawned that model with an extra
+         model-level yaw of -1.5708 to align local Y -> world +X). This
+         "hull" link instead uses local +X as forward (spawned with yaw 0,
+         matching the working primitive boat and this file's
+         START_POINT->END_POINT / thruster layout). So every mesh visual's
+         <pose> below has been re-expressed in hull's frame via the fixed
+         rotation that reconciles the two conventions:
+             new_x   = old_y
+             new_y   = -old_x
+             new_z   = old_z          (unchanged)
+             new_yaw = old_yaw - 1.5708   (roll/pitch unchanged)
+         This is a pure re-labelling of axes, not a physical change - the
+         parts still sit in the same place relative to the hull, just
+         described in the frame this model actually uses. If anything
+         looks rotated 90 degrees from what you expect, this is the first
+         place to check.
 
-      <!-- Wave-aware hydrodynamics from asv_wave_sim: buoyancy against the live
-           wave surface + drag/damping, and it listens on /ocean_current for
-           current forcing. -->
+         COSMETIC NOTE: the CAD meshes include their own motor/propeller
+         geometry (motor, extension_shaft, composite_part_1/1_2) as part
+         of the FIXED hull visual - they don't spin. The separate
+         left_prop/right_prop cylinders (unchanged, still attached via the
+         thruster joints) are what actually rotates. If you want the real
+         propeller mesh to spin instead of the placeholder cylinder, that's
+         a follow-up: move composite_part_1/composite_part_1_2 out of hull
+         and onto left_prop/right_prop, at that link's local origin. Not
+         done here since it would touch geometry rather than just visuals. -->
+    <model name="test_boat">
+      <pose>0 0 0.1 0 0.031 0</pose>
+
+      <link name="hull">
+        <inertial>
+          <mass>1.0</mass>
+          <inertia>
+            <ixx>0.404</ixx><iyy>0.59206</iyy><izz>0.98806</izz>
+            <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+          </inertia>
+        </inertial>
+        <enable_wind>true</enable_wind>
+
+        <!-- ===== COLLISION - unchanged from the working build ===== -->
+        <collision name="collision_nose">
+          <pose>0.0425 0 0 0 0 0</pose>
+          <geometry><cylinder><radius>0.2</radius><length>0.04</length></cylinder></geometry>
+        </collision>
+
+        <collision name="collision_body">
+          <pose>-0.06 0 0 0 0 0</pose>
+          <geometry><box><size>0.205 0.4 0.04</size></box></geometry>
+        </collision>
+
+        <collision name="collision_leg_left">
+          <pose>-0.2025 0.1375 0 0 0 0</pose>
+          <geometry><box><size>0.08 0.125 0.04</size></box></geometry>
+        </collision>
+
+        <collision name="collision_leg_right">
+          <pose>-0.2025 -0.1375 0 0 0 0</pose>
+          <geometry><box><size>0.08 0.125 0.04</size></box></geometry>
+        </collision>
+
+        <!-- ===== VISUAL - detailed CAD meshes, re-oriented into hull's frame ===== -->
+
+        <!-- Part box (main hull shell) -->
+        <visual name="visual_box">
+          <pose>-0.0388032 0.120871 0.0703204 0 0 0</pose>
+          <geometry>
+            <mesh><uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/realRobot/rescue-float-robot/assets/box.stl</uri></mesh>
+          </geometry>
+          <material><ambient>0.901961 0.901961 0.901961 1</ambient><diffuse>0.901961 0.901961 0.901961 1</diffuse></material>
+        </visual>
+
+        <!-- Assembly A (rightmotor side) -->
+        <visual name="visual_case_part_2">
+          <pose>-0.159253 0.275871 -0.00865457 0 0 1.5708</pose>
+          <geometry>
+            <mesh><uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/realRobot/rescue-float-robot/assets/case_part_2.stl</uri></mesh>
+          </geometry>
+          <material><ambient>0.913725 0.647059 0.329412 1</ambient><diffuse>0.913725 0.647059 0.329412 1</diffuse></material>
+        </visual>
+        <visual name="visual_motor">
+          <pose>-0.159253 0.275871 -0.00865457 0 0 1.5708</pose>
+          <geometry>
+            <mesh><uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/realRobot/rescue-float-robot/assets/motor.stl</uri></mesh>
+          </geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient><diffuse>0.6 0.6 0.6 1</diffuse></material>
+        </visual>
+        <visual name="visual_extension_shaft">
+          <pose>-0.159253 0.275871 -0.00865457 0 0 1.5708</pose>
+          <geometry>
+            <mesh><uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/realRobot/rescue-float-robot/assets/extension_shaft.stl</uri></mesh>
+          </geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient><diffuse>0.6 0.6 0.6 1</diffuse></material>
+        </visual>
+        <visual name="visual_case_part_3">
+          <pose>-0.159253 0.275871 -0.00865457 0 0 1.5708</pose>
+          <geometry>
+            <mesh><uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/realRobot/rescue-float-robot/assets/case_part_3.stl</uri></mesh>
+          </geometry>
+          <material><ambient>0.972549 0.529412 0.00392157 1</ambient><diffuse>0.972549 0.529412 0.00392157 1</diffuse></material>
+        </visual>
+        <visual name="visual_case_part_1">
+          <pose>-0.159253 0.275871 -0.00865457 0 0 1.5708</pose>
+          <geometry>
+            <mesh><uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/realRobot/rescue-float-robot/assets/case_part_1.stl</uri></mesh>
+          </geometry>
+          <material><ambient>0.917647 0.917647 0.917647 1</ambient><diffuse>0.917647 0.917647 0.917647 1</diffuse></material>
+        </visual>
+        <visual name="visual_extension">
+          <pose>-0.159253 0.275871 -0.00865457 0 0 1.5708</pose>
+          <geometry>
+            <mesh><uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/realRobot/rescue-float-robot/assets/extension.stl</uri></mesh>
+          </geometry>
+          <material><ambient>0.823529 0.623529 0.0352941 1</ambient><diffuse>0.823529 0.623529 0.0352941 1</diffuse></material>
+        </visual>
+        <visual name="visual_composite_part_1">
+          <pose>-0.0821154 0.275871 -0.00865457 -1.5708 0 1.5708</pose>
+          <geometry>
+            <mesh><uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/realRobot/rescue-float-robot/assets/composite_part_1.stl</uri></mesh>
+          </geometry>
+          <material><ambient>0.917647 0.917647 0.917647 1</ambient><diffuse>0.917647 0.917647 0.917647 1</diffuse></material>
+        </visual>
+
+        <!-- Assembly B (leftmotor side) -->
+        <visual name="visual_case_part_2_2">
+          <pose>-0.159253 -0.0341294 -0.00865457 0 0 1.5708</pose>
+          <geometry>
+            <mesh><uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/realRobot/rescue-float-robot/assets/case_part_2.stl</uri></mesh>
+          </geometry>
+          <material><ambient>0.913725 0.647059 0.329412 1</ambient><diffuse>0.913725 0.647059 0.329412 1</diffuse></material>
+        </visual>
+        <visual name="visual_motor_2">
+          <pose>-0.159253 -0.0341294 -0.00865457 0 0 1.5708</pose>
+          <geometry>
+            <mesh><uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/realRobot/rescue-float-robot/assets/motor.stl</uri></mesh>
+          </geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient><diffuse>0.6 0.6 0.6 1</diffuse></material>
+        </visual>
+        <visual name="visual_extension_shaft_2">
+          <pose>-0.159253 -0.0341294 -0.00865457 0 0 1.5708</pose>
+          <geometry>
+            <mesh><uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/realRobot/rescue-float-robot/assets/extension_shaft.stl</uri></mesh>
+          </geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient><diffuse>0.6 0.6 0.6 1</diffuse></material>
+        </visual>
+        <visual name="visual_case_part_3_2">
+          <pose>-0.159253 -0.0341294 -0.00865457 0 0 1.5708</pose>
+          <geometry>
+            <mesh><uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/realRobot/rescue-float-robot/assets/case_part_3.stl</uri></mesh>
+          </geometry>
+          <material><ambient>0.972549 0.529412 0.00392157 1</ambient><diffuse>0.972549 0.529412 0.00392157 1</diffuse></material>
+        </visual>
+        <visual name="visual_case_part_1_2">
+          <pose>-0.159253 -0.0341294 -0.00865457 0 0 1.5708</pose>
+          <geometry>
+            <mesh><uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/realRobot/rescue-float-robot/assets/case_part_1.stl</uri></mesh>
+          </geometry>
+          <material><ambient>0.917647 0.917647 0.917647 1</ambient><diffuse>0.917647 0.917647 0.917647 1</diffuse></material>
+        </visual>
+        <visual name="visual_extension_2">
+          <pose>-0.159253 -0.0341294 -0.00865457 0 0 1.5708</pose>
+          <geometry>
+            <mesh><uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/realRobot/rescue-float-robot/assets/extension.stl</uri></mesh>
+          </geometry>
+          <material><ambient>0.823529 0.623529 0.0352941 1</ambient><diffuse>0.823529 0.623529 0.0352941 1</diffuse></material>
+        </visual>
+        <visual name="visual_composite_part_1_2">
+          <pose>-0.0821154 -0.0341294 -0.00865457 -1.5708 0 1.5708</pose>
+          <geometry>
+            <mesh><uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/realRobot/rescue-float-robot/assets/composite_part_1.stl</uri></mesh>
+          </geometry>
+          <material><ambient>0.917647 0.917647 0.917647 1</ambient><diffuse>0.917647 0.917647 0.917647 1</diffuse></material>
+        </visual>
+
+        <!-- Deck / hull details -->
+        <visual name="visual_top">
+          <pose>-0.0538032 0.120871 0.17032 3.14159 0 1.5708</pose>
+          <geometry>
+            <mesh><uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/realRobot/rescue-float-robot/assets/top.stl</uri></mesh>
+          </geometry>
+          <material><ambient>1 0.4 0 1</ambient><diffuse>1 0.4 0 1</diffuse></material>
+        </visual>
+        <visual name="visual_bottom">
+          <pose>-0.0538032 0.120871 0.0322204 0 0 -1.5708</pose>
+          <geometry>
+            <mesh><uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/realRobot/rescue-float-robot/assets/bottom.stl</uri></mesh>
+          </geometry>
+          <material><ambient>0.701961 0.701961 0.701961 1</ambient><diffuse>0.701961 0.701961 0.701961 1</diffuse></material>
+        </visual>
+        <visual name="visual_side_handle">
+          <pose>-0.0838032 -0.0291294 0.0703204 0 0 0</pose>
+          <geometry>
+            <mesh><uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/realRobot/rescue-float-robot/assets/side_handle.stl</uri></mesh>
+          </geometry>
+          <material><ambient>1 0.4 0 1</ambient><diffuse>1 0.4 0 1</diffuse></material>
+        </visual>
+        <visual name="visual_side_handle_2">
+          <pose>-0.0838032 0.270871 0.0703204 0 0 0</pose>
+          <geometry>
+            <mesh><uri>/home/phusion/gz_ws/worlds/CrestWaterRobot/models/realRobot/rescue-float-robot/assets/side_handle.stl</uri></mesh>
+          </geometry>
+          <material><ambient>1 0.4 0 1</ambient><diffuse>1 0.4 0 1</diffuse></material>
+        </visual>
+      </link>
+
+      <!-- Thruster pods - unchanged from the working build. -->
+      <link name="left_prop">
+        <pose relative_to="hull">0.10 0.14 0 0 1.5708 0</pose>
+        <inertial><mass>0.05</mass><inertia><ixx>1e-5</ixx><iyy>1e-5</iyy><izz>1e-5</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.025</radius><length>0.07</length></cylinder></geometry>
+          <material><ambient>0.1 0.1 0.1 1</ambient><diffuse>0.1 0.1 0.1 1</diffuse></material>
+        </visual>
+      </link>
+      <joint name="left_thruster_joint" type="revolute">
+        <parent>hull</parent>
+        <child>left_prop</child>
+        <axis><xyz>0 0 1</xyz><limit><lower>-1e16</lower><upper>1e16</upper></limit></axis>
+      </joint>
+
+      <link name="right_prop">
+        <pose relative_to="hull">0.10 -0.14 0 0 1.5708 0</pose>
+        <inertial><mass>0.05</mass><inertia><ixx>1e-5</ixx><iyy>1e-5</iyy><izz>1e-5</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.025</radius><length>0.07</length></cylinder></geometry>
+          <material><ambient>0.1 0.1 0.1 1</ambient><diffuse>0.1 0.1 0.1 1</diffuse></material>
+        </visual>
+      </link>
+      <joint name="right_thruster_joint" type="revolute">
+        <parent>hull</parent>
+        <child>right_prop</child>
+        <axis><xyz>0 0 1</xyz><limit><lower>-1e16</lower><upper>1e16</upper></limit></axis>
+      </joint>
+
+      <!-- Wave-aware hydrodynamics from asv_wave_sim - unchanged. -->
       <plugin filename="gz-waves1-hydrodynamics-system" name="gz::sim::systems::Hydrodynamics">
-        <enable>rescue_float_robot::body</enable>
+        <enable>test_boat::hull</enable>
         <hydrodynamics>
           <damping_on>1</damping_on>
           <viscous_drag_on>1</viscous_drag_on>
@@ -156,17 +384,17 @@
       </plugin>
 
       <plugin filename="gz-sim-thruster-system" name="gz::sim::systems::Thruster">
-        <joint_name>leftmotor</joint_name>
+        <joint_name>left_thruster_joint</joint_name>
         <thrust_coefficient>0.005</thrust_coefficient>
         <fluid_density>1000</fluid_density>
-        <propeller_diameter>0.08</propeller_diameter>
+        <propeller_diameter>0.05</propeller_diameter>
       </plugin>
 
       <plugin filename="gz-sim-thruster-system" name="gz::sim::systems::Thruster">
-        <joint_name>rightmotor</joint_name>
+        <joint_name>right_thruster_joint</joint_name>
         <thrust_coefficient>0.005</thrust_coefficient>
         <fluid_density>1000</fluid_density>
-        <propeller_diameter>0.08</propeller_diameter>
+        <propeller_diameter>0.05</propeller_diameter>
       </plugin>
 
     </model>
