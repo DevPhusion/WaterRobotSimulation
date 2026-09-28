@@ -3,7 +3,7 @@
   <model name="waves">
     <static>true</static>
 
-    <!-- Placeholders (3.022, 121.79, 0.924) are
+    <!-- Placeholders (1.197, 0.27, 0.169) are
          filled in by launch_randomized_world.py before each run. Do not edit
          the numbers by hand in this file - edit the ranges in that script
          instead, or edit THIS template's structure if you need to change
@@ -19,9 +19,9 @@
         <algorithm>fft</algorithm>
         <tile_size>256</tile_size>
         <cell_count>256</cell_count>
-        <wind_speed>3.022</wind_speed>
-        <wind_angle_deg>121.79</wind_angle_deg>
-        <steepness>0.924</steepness>
+        <wind_speed>1.197</wind_speed>
+        <wind_angle_deg>0.27</wind_angle_deg>
+        <steepness>0.169</steepness>
       </wave>
     </plugin>
 
@@ -64,9 +64,9 @@
             <algorithm>fft</algorithm>
             <tile_size>256</tile_size>
             <cell_count>256</cell_count>
-            <wind_speed>3.022</wind_speed>
-            <wind_angle_deg>121.79</wind_angle_deg>
-            <steepness>0.924</steepness>
+            <wind_speed>1.197</wind_speed>
+            <wind_angle_deg>0.27</wind_angle_deg>
+            <steepness>0.169</steepness>
           </wave>
 
           <!--
