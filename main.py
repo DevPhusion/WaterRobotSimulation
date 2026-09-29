@@ -1,57 +1,3 @@
-#!/usr/bin/env python3
-"""
-Autonomous batch tester for the gz-sim dual-thruster boat, with Vietnam
-lake / river environment presets and a rotating water current.
-
-WHAT THIS DOES
-    1. Pops up a config window (environment, current direction mode, runs,
-       seed, timeouts, PID gains, ranges, output paths).
-    2. For each run:
-         a. Draws an environment (see ENVIRONMENTS below): current speed,
-            current direction, and gentle wave parameters. Waves are written
-            into the waves model .sdf; the current is published on
-            /ocean_current (world frame, m/s).
-         b. Launches `gz sim` headless.
-         c. Runs the phases of the selected mode (No PID / PID / PID without
-            cross-track terms), resetting the world between phases so every
-            phase sees the SAME waves and the SAME current.
-         d. Appends summary + time-series rows to CSV.
-         e. Kills gz sim (waves are only re-read at world load).
-    3. After all runs: prints a per-environment summary table and produces
-       the usual plots, plus a polar plot of max cross-track error vs
-       current direction.
-
-ENVIRONMENTS (from the Vietnam lake/river brief + thong_so_moi_truong_song_ho_VN.pdf)
-    lake        current 0.05-0.30 m/s, almost flat water
-    river_dry   current 0.5-1.2 m/s,   light ripples
-    river_rain  current 2.0-3.0 m/s,   light chop (rain-season wind gusts)
-    mixed       a random one of the three per run (seeded)
-    custom      ranges from the dialog fields
-
-CURRENT DIRECTION CONVENTION
-    Angle = direction the WATER FLOWS TOWARD, world frame, degrees CCW from +X.
-    The boat travels along +X, so:
-        0 deg   = following current (helps)
-        180 deg = head-on current (hardest for progress)
-        90/270  = beam current (hardest for cross-track error)
-    Direction mode "random" draws each run uniformly in the angle range;
-    "sweep" spaces the runs evenly around the circle (run 1 = start angle).
-
-WAVE SIZE
-    The FFT wave model is driven by wind_speed. Rule of thumb for fully
-    developed seas is Hs ~ 0.0246 * U^2 (an UPPER bound for lakes/rivers,
-    which are fetch-limited), so U = 1-2.5 m/s gives roughly 0.02-0.15 m,
-    the "still" to "light ripple" band in the report. Steepness is also
-    cut to 0.1-0.5 (was 0.5-3.0). Check visually / with a pose trace.
-
-REQUIREMENTS
-    gz CLI on PATH; python3-gz-transport{12..15}; matplotlib + numpy.
-    Constants below MUST match your world .sdf.
-
-USAGE
-    python3 batch_test_runner.py
-"""
-
 import atexit
 import csv
 import datetime
@@ -69,9 +15,6 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, messagebox
 
-# ============================================================================
-# World / model config - KEEP IN SYNC with your world .sdf
-# ============================================================================
 WORLD_NAME = "water_test"
 MODEL_NAME = "test_boat"
 LEFT_JOINT = "left_thruster_joint"
@@ -111,9 +54,6 @@ LEFT_TOPIC = f"/model/{MODEL_NAME}/joint/{LEFT_JOINT}/cmd_thrust"
 RIGHT_TOPIC = f"/model/{MODEL_NAME}/joint/{RIGHT_JOINT}/cmd_thrust"
 CURRENT_TOPIC = "/ocean_current"
 
-# ============================================================================
-# Environment presets
-# ============================================================================
 ENV_PRESETS = {
     "lake": {
         "label": "Lake",
@@ -152,9 +92,6 @@ CURRENT_ANGLE_RANGE_DEFAULT = (0.0, 360.0)
 CURRENT_RAMP_DEFAULT = 2.0        # s, linear ramp-up of the current at the start of each phase
 DIVERGENCE_ABORT_M = 60.0         # abort a phase if |cross| or backwards progress exceeds this
 
-# ============================================================================
-# Modes -> phases. Each phase is (name, disable_xte_terms)
-# ============================================================================
 MODE_PHASES = {
     "compare": [("no_pid", False), ("pid", False)],
     "pid_tuning": [("pid", False)],
@@ -185,11 +122,6 @@ TS_CSV_FIELDS = [
     "cross_track_m", "cross_track_vel_mps", "cross_track_accel_mps2",
     "along_track_m", "left_thrust_N", "right_thrust_N",
 ]
-
-# ============================================================================
-# Helpers
-# ============================================================================
-
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
@@ -256,11 +188,6 @@ def gz_service(service, reqtype, reptype, req, timeout_ms=2000):
             stdout = ""
             stderr = str(e)
         return _Result()
-
-
-# ============================================================================
-# Environment drawing + wave model writing
-# ============================================================================
 
 
 def draw_environment(run_idx, run_seed, cfg):
@@ -347,10 +274,6 @@ def restore_real_time_factor(backup_path):
         print("Restored original real_time_factor.")
 
 
-# ============================================================================
-# Water current publishing (/ocean_current, gz.msgs.Vector3d, world frame)
-# ============================================================================
-
 _current_pub = None
 _current_vec = (0.0, 0.0)
 
@@ -387,10 +310,6 @@ def stop_current():
         _publish_vec(0.0, 0.0)
         time.sleep(TICK_S)
 
-
-# ============================================================================
-# gz sim process management
-# ============================================================================
 
 _active_gz_proc = None
 
@@ -451,10 +370,6 @@ def reset_world(world_name):
     return result
 
 
-# ============================================================================
-# Pose tracking
-# ============================================================================
-
 
 class PoseState:
     def __init__(self):
@@ -502,10 +417,6 @@ def reset_and_wait(state):
 
 
 def verify_current_response(state, test_speed=1.0, duration=4.0):
-    """Sanity check, run once at the start of run 1: zero thrust, push a
-    1 m/s current along +X for a few seconds and see whether the boat drifts.
-    If it doesn't, the hydrodynamics plugin on the hull is ignoring
-    /ocean_current and none of the current-based results are meaningful."""
     print(f"  [check] applying {test_speed} m/s current along +X with zero thrust for {duration:.0f}s...")
     set_current_vector(test_speed, 0.0)
     x0 = state.x
@@ -525,17 +436,8 @@ def verify_current_response(state, test_speed=1.0, duration=4.0):
     return drift_v
 
 
-# ============================================================================
-# Control loop for one phase
-# ============================================================================
-
 
 def run_phase(state, pub_left, pub_right, mode, cfg, run_idx):
-    """Runs one phase and returns (metrics dict, per-tick records list).
-    Any mode other than "no_pid" uses the heading PID (+ optional
-    cross-track position/velocity/acceleration terms). The water current is
-    re-published every tick, ramped up over cfg["current_ramp_s"], and
-    zeroed again when the phase ends."""
     integral = 0.0
     prev_error = 0.0
     max_abs_cross = 0.0
@@ -650,11 +552,6 @@ def run_phase(state, pub_left, pub_right, mode, cfg, run_idx):
     return metrics, records
 
 
-# ============================================================================
-# CSV logging
-# ============================================================================
-
-
 def _fmt(v, digits=4):
     return f"{v:.{digits}f}" if isinstance(v, float) and v == v else ("" if v is None else v)
 
@@ -709,11 +606,6 @@ def append_timeseries_rows(csv_path, run_idx, mode, records):
                 "left_thrust_N": f"{rec['left_thrust_N']:.3f}",
                 "right_thrust_N": f"{rec['right_thrust_N']:.3f}",
             })
-
-
-# ============================================================================
-# One full run (all modes share this: phases come from MODE_PHASES)
-# ============================================================================
 
 
 def run_single(run_idx, run_seed, cfg, csv_path, ts_csv_path):
@@ -775,10 +667,6 @@ def run_single(run_idx, run_seed, cfg, csv_path, ts_csv_path):
         terminate_gz_process(proc)
         time.sleep(1.0)
 
-
-# ============================================================================
-# Config dialog (last-used values are remembered)
-# ============================================================================
 
 CONFIG_SAVE_PATH = Path(__file__).resolve().parent / "batch_test_runner_last_config.json"
 
@@ -853,7 +741,6 @@ def show_config_dialog():
         ttk.Entry(group, textvariable=v, width=12).grid(row=r, column=1, sticky="e", padx=6, pady=2)
         fields[key] = v
 
-    # ---------------- Column A: what to run ----------------
     mode_var = tk.StringVar(value=sv("mode", "compare"))
     add_radio_group(col_a, "Mode", mode_var, [
         ("Compare (No PID vs PID)", "compare"),
@@ -878,7 +765,6 @@ def show_config_dialog():
     add_row(g, "gz sim boot wait (s)", "boot", 3.0)
     add_row(g, "Real-time factor (1.0 = no change)", "rtf", 1.0)
 
-    # ---------------- Column B: controller + current/wave direction ----------------
     g = add_group(col_b, "Controller")
     add_row(g, "Base thrust (N)", "base", BASE_THRUST_DEFAULT)
     add_row(g, "PID Kp", "kp", KP_DEFAULT)
@@ -896,7 +782,6 @@ def show_config_dialog():
     add_row(g, "Wave direction min (deg)", "wa_min", WAVE_ANGLE_RANGE_DEFAULT[0])
     add_row(g, "Wave direction max (deg)", "wa_max", WAVE_ANGLE_RANGE_DEFAULT[1])
 
-    # ---------------- Column C: custom env + outputs + options ----------------
     g = add_group(col_c, "Custom environment (only if 'Custom')")
     add_row(g, "Current speed min (m/s)", "cur_min", CUSTOM_CURRENT_RANGE_DEFAULT[0])
     add_row(g, "Current speed max (m/s)", "cur_max", CUSTOM_CURRENT_RANGE_DEFAULT[1])
@@ -918,7 +803,6 @@ def show_config_dialog():
     ttk.Checkbutton(g, text="Verify /ocean_current moves the boat (run 1)",
                     variable=verify_var).pack(anchor="w", padx=6, pady=2)
 
-    # ---------------- Bottom: note + buttons ----------------
     ttk.Label(root, foreground="#555", wraplength=1000, justify="left",
               text="Presets (lake / river dry / river rain / mixed) set current speed, wave wind and "
                    "steepness themselves; the Custom fields are only used for 'Custom'. "
@@ -979,11 +863,6 @@ def show_config_dialog():
 
     root.mainloop()
     return result if started["ok"] else None
-
-
-# ============================================================================
-# Summary + plotting
-# ============================================================================
 
 
 def print_summary_table(csv_path):
@@ -1163,11 +1042,6 @@ def _gains_str(cfg):
 
 
 def make_comparison_plots(csv_path, ts_csv_path, out_path, cfg, modes):
-    """Replaces the old make_plot / make_xte_compare_plot / make_full_real_plot:
-    max- and final-divergence scatters plus mean +/- std time series
-    (|cross-track|, heading, along-track). With all three of no_pid /
-    pid_xte / pid_no_xte it also draws a PID-only cross-track plot so the
-    XTE effect isn't flattened by no_pid's much larger error."""
     names = " vs ".join(PHASE_STYLE[m][1] for m in modes)
     g = f"[{_gains_str(cfg)}]"
 
@@ -1196,9 +1070,6 @@ def make_comparison_plots(csv_path, ts_csv_path, out_path, cfg, modes):
 
 
 def make_current_direction_plot(csv_path, out_path, modes, value_col="max_abs_cross_track_m"):
-    """Polar plot: radius = max |cross-track| per run, angle = direction the
-    water flows toward (0 deg = along +X = following, 180 = head-on,
-    90/270 = beam). Shows at which current headings the controller struggles."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1233,8 +1104,6 @@ def make_current_direction_plot(csv_path, out_path, modes, value_col="max_abs_cr
 
 
 def make_pid_tuning_plot(ts_csv_path, out_path, cfg):
-    """Stacked diagnostics for PID-only runs: heading error, cross-track
-    error, cross-track drift velocity/acceleration, and thruster commands."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1288,12 +1157,6 @@ def make_pid_tuning_plot(ts_csv_path, out_path, cfg):
     plt.close(fig)
     print(f"Saved PID tuning diagnostics plot to {out_path}")
     return True
-
-
-# ============================================================================
-# Main
-# ============================================================================
-
 
 def main():
     if NodeCls is None:
