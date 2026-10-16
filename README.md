@@ -107,11 +107,9 @@ Also check the absolute `<uri>` paths inside `mainSimulation.sdf`.
 ## Running
 
 ```bash
-python3 main.py                  # single run
-python3 batch_test_runner.py     # batch testing (opens a config window)
+python3 main.py                  # batch testing (opens a config window)
+python3 singleTestRunner.py     # single run test
 ```
-
-<!-- TODO: describe what main.py does in your version -->
 
 Launch the world manually:
 
