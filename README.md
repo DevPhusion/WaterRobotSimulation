@@ -212,7 +212,7 @@ Max cross-track error |e_d| in metres, read from the plots (approximate):
 
 ## Credits
 
-Le Hoang Minh Phu: devphusion@gmail.com
-Le Hai Lam: lamlhl2009@gmail.com
+- Le Hoang Minh Phu: devphusion@gmail.com
+- Le Hai Lam: lamlhl2009@gmail.com
 
 Built with [Gazebo Sim](https://gazebosim.org/), [asv_wave_sim](https://github.com/srmainwaring/asv_wave_sim) and CAD meshes exported with [onshape-to-robot](https://github.com/Rhoban/onshape-to-robot).
