@@ -8,6 +8,9 @@ A Gazebo Sim simulation of a dual-thruster rescue float robot on **Vietnamese la
 
 **Result:** over 450 trials (3 environments × 50 runs × 3 controllers), PIDXTE gave the smallest cross-track error in every environment, typically 2 to 3 times smaller than the heading-only PID. See [Results](#results).
 
+<img width="590" height="360" alt="image" src="https://github.com/user-attachments/assets/1c8ba4ed-eb52-455d-a3a9-472029dbd2c9" />
+
+
 ---
 
 ## Table of contents
